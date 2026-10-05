@@ -1,0 +1,29 @@
+# Milestone 8 on CPU: small Transformer over 3 stages.
+job:
+  name: tiny-transformer-cpu
+
+model:
+  type: tiny_transformer
+  layers: 6
+  hidden_size: 128
+  heads: 4
+  vocab_size: 128
+  seq_len: 32
+
+training:
+  batch_size: 16
+  microbatch_size: 4
+  learning_rate: 0.001
+  optimizer: adamw
+  steps: 150
+  log_every: 25
+
+placement:
+  strategy: equal
+  num_stages: 3
+
+workers:
+  allow: [cpu, cuda, mps]
+
+network:
+  tensor_transport: tcp

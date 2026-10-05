@@ -1,0 +1,30 @@
+# Scenario A: two CUDA machines (RTX ~8 GB + RTX ~12 GB), tiny Transformer.
+job:
+  name: two-cuda-transformer
+
+model:
+  type: tiny_transformer
+  layers: 12
+  hidden_size: 512
+  heads: 8
+  vocab_size: 1024
+  seq_len: 128
+
+training:
+  batch_size: 16
+  microbatch_size: 4
+  learning_rate: 0.0003
+  optimizer: adamw
+  steps: 500
+  log_every: 25
+
+placement:
+  strategy: auto
+  num_stages: 2
+
+workers:
+  allow: [cuda]
+
+network:
+  tensor_transport: tcp
+  timeout_s: 120
