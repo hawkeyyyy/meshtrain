@@ -121,10 +121,12 @@ class Outbox:
             packet = TensorPacket(mtype, shape=shape, dtype=dtype, payload=payload, **f)
         link = self.links[item.link]
         before = link.bytes_sent
-        with tl.span("NETWORK_SEND", step, mb, link=item.link, bytes=len(packet.payload)):
-            link.send_packet(packet)
-        if release is not None:
-            release()
+        try:
+            with tl.span("NETWORK_SEND", step, mb, link=item.link, bytes=len(packet.payload)):
+                link.send_packet(packet)
+        finally:
+            if release is not None:
+                release()
         self.bytes_sent[item.link] += link.bytes_sent - before
         self.sent_messages += 1
         if item.notify and self.events is not None:

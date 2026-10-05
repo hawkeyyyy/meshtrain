@@ -111,6 +111,23 @@ class NetworkConfig(_Strict):
     max_tensor_mb: float = Field(1024.0, gt=0)
 
 
+class PipelineConfig(_Strict):
+    schedule: Literal["gpipe", "1f1b"] = "gpipe"
+    # Cap on microbatch graphs a stage may hold at once (1f1b); None = pipeline depth.
+    max_inflight_microbatches: int | None = Field(None, ge=1)
+
+
+class TransportConfig(_Strict):
+    # async: sends run on a per-link sender thread (overlap with compute).
+    # false reproduces V1 blocking sends (kept as a baseline).
+    async_: bool = Field(True, alias="async")
+    pinned_memory: bool = True   # CUDA: page-locked staging buffers
+    buffer_pool: bool = True     # reuse staging buffers across microbatches
+    max_outbound_queue: int | None = Field(None, ge=1)  # messages per link; default 2*M+4
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
 class MeshTrainConfig(_Strict):
     job: JobConfig = JobConfig()
     model: ModelConfig
@@ -118,6 +135,8 @@ class MeshTrainConfig(_Strict):
     placement: PlacementConfig = PlacementConfig()
     workers: WorkersConfig = WorkersConfig()
     network: NetworkConfig = NetworkConfig()
+    pipeline: PipelineConfig = PipelineConfig()
+    transport: TransportConfig = TransportConfig()
 
     @model_validator(mode="after")
     def _check(self):
@@ -126,6 +145,18 @@ class MeshTrainConfig(_Strict):
             if self.placement.stages[0].layers[0] != 0 or self.placement.stages[-1].layers[1] != n:
                 raise ValueError(f"manual stages must cover layers [0, {n})")
         return self
+
+    def pipeline_settings(self, job_id: str, **overrides):
+        """PipelineSettings for this config (shared by workers and local runs)."""
+        from meshtrain.runtime.pipeline import PipelineSettings
+
+        kw = dict(job_id=job_id, steps=self.training.steps, batch_size=self.training.batch_size,
+                  num_microbatches=self.training.num_microbatches, timeout_s=self.network.timeout_s,
+                  log_every=self.training.log_every, schedule=self.pipeline.schedule,
+                  max_inflight_microbatches=self.pipeline.max_inflight_microbatches,
+                  async_transport=self.transport.async_, max_outbound_queue=self.transport.max_outbound_queue)
+        kw.update(overrides)
+        return PipelineSettings(**kw)
 
     def model_num_layers(self) -> int:
         from meshtrain.models import build_model_spec

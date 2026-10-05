@@ -33,7 +33,7 @@ class LocalStage:
 
 
 def _stage_process(index, stages, model_cfg, seed, settings, optimizer, lr, transport, links,
-                   results, capture_params, torch_threads):
+                   results, capture_params, torch_threads, link_emulation=None):
     os.environ.setdefault("MESHTRAIN_QUIET", "1")
     threads = stages[index].threads or torch_threads
     if threads:
@@ -64,6 +64,12 @@ def _stage_process(index, stages, model_cfg, seed, settings, optimizer, lr, tran
             if listener is not None:
                 up, _hello = listener.accept(timeout=settings.timeout_s)
                 listener.close()
+        if link_emulation is not None:
+            from meshtrain.networking.emulation import EmulatedLink
+
+            bw, lat = link_emulation
+            up = EmulatedLink(up, bw, lat) if up is not None else None
+            down = EmulatedLink(down, bw, lat) if down is not None else None
         stage = Stage(spec.build_stage(*st.layers), stage_index=index, num_stages=len(stages),
                       device=select_device(st.device), optimizer=optimizer, lr=lr, loss_fn=spec.loss_fn,
                       name=worker)
@@ -133,7 +139,9 @@ def run_local_pipeline(
     capture_params: bool = False,
     torch_threads: int | None = 1,
     timeout_s: float = 600.0,
+    link_emulation: tuple[float, float] | None = None,
 ) -> list[StageResult]:
+    """``link_emulation=(bandwidth_Bps, latency_s)`` throttles every link (experiments only)."""
     ctx = mp.get_context("spawn")
     results = ctx.Queue()
     manager = None
@@ -147,7 +155,7 @@ def run_local_pipeline(
     procs = [
         ctx.Process(target=_stage_process, name=f"meshtrain-stage{i}",
                     args=(i, stages, model_cfg, seed, settings, optimizer, lr, transport, links, results,
-                          capture_params, torch_threads))
+                          capture_params, torch_threads, link_emulation))
         for i in range(len(stages))
     ]
     for p in procs:

@@ -23,7 +23,7 @@ from meshtrain.config import parse_config
 from meshtrain.networking.tcp import TCPListener, TCPTransport, connect
 from meshtrain.networking.transport import TransportTimeout
 from meshtrain.profiler.network import serve_probe
-from meshtrain.runtime.pipeline import PipelineSettings, StageResult, run_stage
+from meshtrain.runtime.pipeline import StageResult, run_stage
 from meshtrain.runtime.stage import Stage
 from meshtrain.telemetry import EventLogger
 from meshtrain.worker.device import DeviceAdapter
@@ -131,11 +131,7 @@ def run_assignment(
             up.frame_timeout_s = timeout
             up.max_payload_bytes = max_bytes
             logger.log("LINK_CONNECTED", direction="upstream", peer=up.peer)
-        settings = PipelineSettings(
-            job_id=job_id, steps=cfg.training.steps, batch_size=cfg.training.batch_size,
-            num_microbatches=cfg.training.num_microbatches, timeout_s=timeout,
-            log_every=cfg.training.log_every, log_microbatch_events=bool(assignment.get("trace", False)),
-        )
+        settings = cfg.pipeline_settings(job_id, log_microbatch_events=bool(assignment.get("trace", False)))
         return run_stage(stage, spec, settings, upstream=up, downstream=down, worker=worker_name, logger=logger,
                          metrics_callback=metrics_callback, stop_event=stop_event)
     finally:

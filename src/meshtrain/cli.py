@@ -316,7 +316,6 @@ def _train_local(args) -> int:
     with this machine's devices."""
     from meshtrain.config import load_config
     from meshtrain.runtime.local import LocalStage, run_local_pipeline
-    from meshtrain.runtime.pipeline import PipelineSettings
     from meshtrain.summary import format_summary, summarize
     from meshtrain.telemetry import MetricsWriter, new_run_id
 
@@ -331,9 +330,7 @@ def _train_local(args) -> int:
     run_dir = os.path.join(cfg.job.runs_dir, run_id)
     print(f"local run {run_id}: " + " | ".join(f"stage{i} {s.device} layers {s.layers[0]}-{s.layers[1] - 1}"
                                                for i, s in enumerate(stages)), flush=True)
-    settings = PipelineSettings(job_id=run_id, steps=cfg.training.steps, batch_size=cfg.training.batch_size,
-                                num_microbatches=cfg.training.num_microbatches, timeout_s=cfg.network.timeout_s,
-                                log_every=cfg.training.log_every)
+    settings = cfg.pipeline_settings(run_id)
     transport = "tcp" if cfg.network.tensor_transport == "tcp" else "pipe"
     os.environ.pop("MESHTRAIN_QUIET", None)
     results = run_local_pipeline(cfg.model.spec_kwargs(), stages, settings, seed=cfg.job.seed,
