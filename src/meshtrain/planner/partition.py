@@ -43,6 +43,7 @@ class WorkerProfile:
     unified_memory: bool = False
     supported_dtypes: tuple[str, ...] = ("float32", "float16", "bfloat16", "float64")
     compute_score: float = 1.0
+    supported_ops: dict | None = None   # dtype -> ops the worker's probes ran (None = unknown)
 
 
 @dataclass
@@ -153,6 +154,7 @@ class PlannerOptions:
     safety_factors: dict = field(default_factory=lambda: dict(DEFAULT_SAFETY_FACTOR))
     framework_reserve: dict = field(default_factory=lambda: dict(DEFAULT_FRAMEWORK_RESERVE))
     budget_overrides: dict = field(default_factory=dict)  # worker_id -> total bytes (startup replanning)
+    required_ops: tuple[str, ...] = ()
 
     def memory_kwargs(self, backend: str) -> dict:
         if self.headroom_fraction is not None or self.headroom_min_bytes is not None:
@@ -206,6 +208,9 @@ def eligible_workers(workers: list[WorkerProfile], opts: PlannerOptions) -> tupl
             excluded[w.name] = f"backend {w.backend} not allowed"
         elif opts.dtype not in w.supported_dtypes:
             excluded[w.name] = f"no {opts.dtype} support"
+        elif w.supported_ops is not None and set(opts.required_ops) - set(w.supported_ops.get(opts.dtype, ())):
+            missing = sorted(set(opts.required_ops) - set(w.supported_ops.get(opts.dtype, ())))
+            excluded[w.name] = f"cannot run {', '.join(missing)} in {opts.dtype}"
         elif _usable(w, opts) <= 0:
             excluded[w.name] = "memory below safety margin"
         else:

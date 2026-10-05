@@ -21,6 +21,9 @@ def layer_seed(seed: int, index: int) -> int:
 
 class ModelSpec(abc.ABC):
     name: str = "model"
+    # Operators every stage may need (see worker/capabilities.py); the planner
+    # excludes workers whose probes say they cannot run them.
+    required_ops: tuple[str, ...] = ("linear", "cross_entropy")
 
     def __init__(self, seed: int = 0, dtype: torch.dtype = torch.float32):
         self.seed = seed

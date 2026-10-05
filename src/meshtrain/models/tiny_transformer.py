@@ -61,6 +61,7 @@ class LMHead(nn.Module):
 
 class TinyTransformerSpec(ModelSpec):
     name = "tiny_transformer"
+    required_ops = ("embedding", "linear", "layer_norm", "gelu", "sdpa", "cross_entropy")
 
     def __init__(self, layers: int = 6, hidden_size: int = 256, heads: int = 4, vocab_size: int = 256,
                  seq_len: int = 64, seed: int = 0, dtype: torch.dtype = torch.float32):

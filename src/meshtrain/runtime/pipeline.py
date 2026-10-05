@@ -82,6 +82,7 @@ class PipelineSettings:
     trace: bool = True                      # keep every timeline span (else only the current step)
     pinned_memory: bool = True              # CUDA: page-locked staging buffers
     buffer_pool: bool = True                # reuse staging / receive buffers
+    correctness_probe_steps: int = 0        # record per-parameter grad norms (+ first-update deltas)
 
 
 @dataclass
@@ -371,12 +372,23 @@ def run_stage(
                 raise fail_dump("schedule finished with incomplete microbatches")
             if settings.capture_gradients_at_step == step:
                 result.gradients = stage.named_gradients()
+            probe = local_step < settings.correctness_probe_steps
+            if probe:
+                grad_norms = {n: float(p.grad.detach().float().norm()) for n, p in stage.module.named_parameters()
+                              if p.grad is not None}
+                before = stage.named_parameters_cpu() if local_step == 0 else None
             mem = stage.memory_report()  # gradients present, before zero_grad
             mem["saved_activations_peak"] = peak_saved_bytes
             mem["saved_microbatches_peak"] = peak_saved_mbs
             with tl.span("OPTIMIZER_STEP", step):
                 opt_s = stage.optimizer_step()
             stage.zero_grad()
+            if probe:
+                correctness = {"grad_norms": grad_norms}
+                if before is not None:
+                    after = stage.named_parameters_cpu()
+                    correctness["param_delta_norms"] = {n: float((after[n] - before[n]).float().norm())
+                                                        for n in before}
             t_step1 = tl.now()
             step_s = t_step1 - t_step0
             m = tl.step_metrics(step, (t_step0, t_step1))
@@ -405,6 +417,8 @@ def run_stage(
                 "memory": {**mem, "device_allocated": dev_mem.get("allocated", 0),
                            "device_peak": dev_mem.get("peak_allocated", 0), "device_total": dev_mem.get("total", 0)},
             }
+            if probe:
+                record["correctness"] = correctness  # local parameter names (layer index within the stage)
             if stage.is_first:
                 record["loss"] = mean_loss
                 record["samples_per_s"] = settings.batch_size / step_s if step_s else 0.0

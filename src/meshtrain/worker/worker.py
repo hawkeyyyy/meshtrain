@@ -49,6 +49,7 @@ class WorkerAgent:
         self.runs_dir = runs_dir
         self.quick_benchmark = quick_benchmark
         self.dataplane = DataPlaneServer(bind_host, data_port, token=token, logger=self.log).start()
+        self.capabilities = self.device.capabilities()  # probes run once, at startup
         self.advertise_host = advertise_host or guess_advertise_host(self.client.base)
         self.worker_id: str | None = None
         self._stop = threading.Event()
@@ -61,6 +62,7 @@ class WorkerAgent:
         resp = self.client.register({
             "name": self.name, "hardware": self.hardware, "backend": self.device.backend,
             "device": self.device.describe(), "data_host": self.advertise_host, "data_port": self.dataplane.port,
+            "capabilities": self.capabilities,
         })
         self.worker_id = resp["worker_id"]
         self.log.worker = self.worker_id

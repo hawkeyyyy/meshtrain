@@ -77,3 +77,23 @@ def test_cuda_overlap_is_measured_under_emulated_link():
     s = PipelineSettings("ov", steps=4, batch_size=16, num_microbatches=8, schedule="1f1b", async_transport=True)
     res = run_local_pipeline(cfg, stages, s, transport="tcp", link_emulation=(100e6 / 8, 0.001))
     assert sum(m["overlapped_s"] for r in res for m in r.step_metrics[1:]) > 0
+
+
+@pytest.mark.mps
+@pytest.mark.parametrize("devices", [["cpu", "mps"], ["cpu", "cpu", "mps"], ["mps", "mps"]])
+def test_mps_pipeline_device_correctness(devices):
+    """Loss, gradients, gradient norms, first-update deltas and outputs vs a CPU reference."""
+    from meshtrain.experiments.device_correctness import ACCEL_TOL, run_device_correctness
+
+    r = run_device_correctness(devices, steps=3)
+    assert r["passed"], r["errors"]
+    assert r["tolerance"] == ACCEL_TOL
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("devices", [["cuda", "cuda"], ["cpu", "cuda", "cuda"]])
+def test_cuda_pipeline_device_correctness(devices):
+    from meshtrain.experiments.device_correctness import run_device_correctness
+
+    r = run_device_correctness(devices, steps=3)
+    assert r["passed"], r["errors"]

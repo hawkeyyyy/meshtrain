@@ -25,17 +25,19 @@ class WorkerRegistry:
         self.on_offline: list[Callable[[WorkerRecord], None]] = []
 
     def register(self, *, name: str, hardware: dict, backend: str, device_info: dict, data_host: str,
-                 data_port: int) -> WorkerRecord:
+                 data_port: int, capabilities: dict | None = None) -> WorkerRecord:
         with self._lock:
             base = _slug(name)
             # Re-registration of the same name+address reuses the id (worker restart).
             for w in self._workers.values():
                 if w.name == base and (w.data_host, w.data_port) == (data_host, data_port):
                     w.hardware, w.backend, w.device_info = hardware, backend, device_info
+                    w.capabilities = capabilities or {}
                     w.status, w.last_heartbeat, w.current_job = WorkerStatus.ONLINE, time.time(), None
                     return w
             worker_id = base if base not in self._workers else f"{base}-{uuid.uuid4().hex[:4]}"
-            rec = WorkerRecord(worker_id, worker_id, hardware, backend, device_info, data_host, data_port)
+            rec = WorkerRecord(worker_id, worker_id, hardware, backend, device_info, data_host, data_port,
+                               capabilities=capabilities or {})
             self._workers[worker_id] = rec
             self._queues[worker_id] = queue.Queue()
             return rec

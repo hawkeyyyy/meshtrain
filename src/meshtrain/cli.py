@@ -371,6 +371,12 @@ def cmd_experiment(args) -> int:
 
         client = _client(args) if args.mode == "hardware" else None  # same cluster/token as `meshtrain status`
         print(run_experiment5(mode=args.mode, cluster_file=args.cluster, steps=args.steps, client=client))
+    elif args.name == "device-correctness":
+        from meshtrain.experiments.device_correctness import format_device_correctness, run_device_correctness
+
+        r = run_device_correctness(args.devices.split(","), steps=args.steps)
+        print(format_device_correctness(r))
+        return 0 if r["passed"] else 1
     elif args.name == "transformer":
         from meshtrain.experiments.transformer import run_experiment_transformer
 
@@ -470,7 +476,8 @@ def build_parser() -> argparse.ArgumentParser:
     rr.set_defaults(func=cmd_results_record)
 
     e = sub.add_parser("experiment", parents=[common])
-    e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer"])
+    e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer", "device-correctness"])
+    e.add_argument("--devices", default="cpu,cpu", help="device-correctness: one device per stage, e.g. cuda,cuda,mps")
     e.add_argument("--transport", default="tcp", choices=["pipe", "tcp"])
     e.add_argument("--mode", default="emulated", choices=["emulated", "hardware"],
                    help="capacity: emulated device budgets on CPU, or real devices of this cluster")

@@ -49,6 +49,7 @@ class RegisterRequest(BaseModel):
     device: dict
     data_host: str
     data_port: int
+    capabilities: dict = {}
 
 
 class HeartbeatRequest(BaseModel):
@@ -377,7 +378,8 @@ def create_app(coordinator: Coordinator) -> FastAPI:
     @app.post("/workers/register", dependencies=[Depends(auth)])
     def register(req: RegisterRequest):
         w = c.registry.register(name=req.name, hardware=req.hardware, backend=req.backend,
-                                device_info=req.device, data_host=req.data_host, data_port=req.data_port)
+                                device_info=req.device, data_host=req.data_host, data_port=req.data_port,
+                                capabilities=req.capabilities)
         c.log.log("WORKER_REGISTERED", worker_id=w.worker_id, backend=w.backend,
                   data=f"{w.data_host}:{w.data_port}")
         return {"worker_id": w.worker_id, "heartbeat_interval_s": max(1.0, c.registry.heartbeat_timeout_s / 4)}

@@ -22,12 +22,18 @@ def worker_profile(w: WorkerRecord) -> WorkerProfile:
         total = int(w.hardware.get("ram_available") or w.hardware.get("ram_total", 0))
     else:
         total = int(dev.get("memory_total", 0))
-    dtypes = ("float32", "float16", "bfloat16", "float64")
-    if w.backend == "mps":
-        dtypes = ("float32", "float16", "bfloat16")
+    caps = w.capabilities or {}
+    if caps:  # measured by the worker's probes at registration
+        dtypes = tuple(dt for dt, key in (("float32", "supports_fp32"), ("float16", "supports_fp16"),
+                                          ("bfloat16", "supports_bf16"), ("float64", "supports_fp64"))
+                       if caps.get(key))
+    else:  # older worker: static assumptions
+        dtypes = ("float32", "float16", "bfloat16") if w.backend == "mps" else \
+            ("float32", "float16", "bfloat16", "float64")
     flops = (w.benchmark or {}).get("measured_flops") or UNBENCHMARKED_FLOPS.get(w.backend, 5e10)
     return WorkerProfile(w.worker_id, w.name, w.backend, total, float(flops),
-                         unified_memory=bool(dev.get("unified_memory")), supported_dtypes=dtypes)
+                         unified_memory=bool(dev.get("unified_memory")), supported_dtypes=dtypes,
+                         supported_ops=caps.get("op_capabilities"))
 
 
 def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: NetworkModel | None = None,
@@ -56,6 +62,7 @@ def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: Network
         safety_factors=cfg.memory.safety_factors(),
         framework_reserve=cfg.memory.framework_reserve_bytes(),
         budget_overrides=dict(budget_overrides or {}),
+        required_ops=tuple(spec.required_ops) + (("adamw",) if cfg.training.optimizer in ("adam", "adamw") else ()),
     )
     if pc.strategy == "manual":
         return plan_manual(layers, profiles, network or NetworkModel(), opts,

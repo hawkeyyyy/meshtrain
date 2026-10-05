@@ -37,6 +37,7 @@ class WorkerRecord:
     memory: dict = field(default_factory=dict)
     benchmark: dict | None = None
     current_job: str | None = None
+    capabilities: dict = field(default_factory=dict)
 
     def public(self) -> dict:
         return {
@@ -47,6 +48,7 @@ class WorkerRecord:
             "device": self.device_info, "data_address": f"{self.data_host}:{self.data_port}",
             "status": self.status.value, "last_heartbeat_age_s": round(time.time() - self.last_heartbeat, 1),
             "memory": self.memory, "benchmark": self.benchmark, "current_job": self.current_job,
+            "device_capabilities": self.capabilities,
         }
 
 

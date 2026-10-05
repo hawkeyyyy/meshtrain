@@ -19,6 +19,7 @@ from meshtrain.models.base import ModelSpec
 
 class MLPSpec(ModelSpec):
     name = "mlp"
+    required_ops = ("linear", "gelu", "cross_entropy")
 
     def __init__(self, sizes: list[int] | None = None, seed: int = 0, dtype: torch.dtype = torch.float32):
         super().__init__(seed, dtype)

@@ -16,6 +16,8 @@ import torch
 
 from meshtrain.runtime.buffers import BufferPool
 
+_OP_PROBES = ("matmul", "linear", "gelu", "layer_norm", "softmax", "sdpa", "embedding", "cross_entropy", "adamw")
+
 
 class DeviceAdapter(abc.ABC):
     backend: str = "abstract"
@@ -119,16 +121,46 @@ class DeviceAdapter(abc.ABC):
     def supports_dtype(self, dtype: torch.dtype) -> bool:
         return True
 
-    def supports(self, operation: str) -> bool:
-        """Capability query. Operation names: 'float64', 'bfloat16', 'float16',
-        'autocast', 'pinned_memory', 'nccl'. Unknown operations are assumed
-        supported so models fail loudly in torch rather than being silently
-        skipped."""
+    def supports(self, operation: str, dtype: str | None = None) -> bool:
+        """Capability query.
+
+        * ``supports("float16")`` / ``"bfloat16"`` / ``"float64"`` -- dtype support
+        * ``supports("pinned_memory")``, ``"nccl"``, ``"autocast"``, ``"async_copy"``
+        * ``supports(op, dtype)`` for model operators (matmul, linear, gelu,
+          layer_norm, softmax, sdpa, embedding, cross_entropy, adamw):
+          answered by actually running a tiny probe on the device (cached).
+        Unknown operations are assumed supported so torch reports real errors.
+        """
+        if dtype is not None or operation in _OP_PROBES:
+            return self.prober.supports(operation, dtype or "float32")
         return {
             "float64": self.supports_dtype(torch.float64),
             "bfloat16": self.supports_dtype(torch.bfloat16),
             "float16": self.supports_dtype(torch.float16),
         }.get(operation, True)
+
+    @property
+    def prober(self):
+        if getattr(self, "_prober", None) is None:
+            from meshtrain.worker.capabilities import CapabilityProber
+
+            self._prober = CapabilityProber(self.device, self.supports_dtype)
+        return self._prober
+
+    def capabilities(self) -> dict:
+        """What this worker advertises at registration (see docs/mps.md)."""
+        stats = self.memory_stats()
+        return {
+            "backend": self.backend,
+            "device_name": self.name(),
+            "total_memory": int(self.memory_total()),
+            "available_memory": int(self.available_memory()),
+            "unified_memory": bool(stats.get("unified")),
+            "pinned_memory": self.supports("pinned_memory"),
+            "async_copy": self.supports("async_copy"),
+            "nccl": self.supports("nccl"),
+            **self.prober.report(),
+        }
 
     def describe(self) -> dict:
         return {"backend": self.backend, "name": self.name(), "memory_total": self.memory_total(),
@@ -167,10 +199,10 @@ class CPUDeviceAdapter(DeviceAdapter):
         return {"total": vm.total, "available": vm.available, "allocated": rss, "reserved": rss,
                 "peak_allocated": rss, "unified": False}
 
-    def supports(self, operation: str) -> bool:
-        if operation in ("pinned_memory", "nccl"):
+    def supports(self, operation: str, dtype: str | None = None) -> bool:
+        if dtype is None and operation in ("pinned_memory", "nccl", "async_copy"):
             return False
-        return super().supports(operation)
+        return super().supports(operation, dtype)
 
     def available_memory(self, in_use: int = 0) -> int:
         # Fault injection for tests/experiments: pretend this worker's device has
@@ -285,10 +317,10 @@ class CUDADeviceAdapter(DeviceAdapter):
             return torch.cuda.is_bf16_supported()
         return True
 
-    def supports(self, operation: str) -> bool:
-        if operation in ("pinned_memory", "nccl", "autocast"):
+    def supports(self, operation: str, dtype: str | None = None) -> bool:
+        if dtype is None and operation in ("pinned_memory", "nccl", "autocast", "async_copy"):
             return True
-        return super().supports(operation)
+        return super().supports(operation, dtype)
 
 
 class MPSDeviceAdapter(DeviceAdapter):
@@ -308,6 +340,20 @@ class MPSDeviceAdapter(DeviceAdapter):
 
     def synchronize(self) -> None:
         torch.mps.synchronize()
+
+    # MPS has a single command queue as far as PyTorch exposes it: there is
+    # no separate transfer stream, so copies are done synchronously on the
+    # compute thread (begin_d2h / begin_h2d defaults). Sending, receiving and
+    # (de)serialisation still overlap with compute on the transport threads.
+    # Correctness over forced asynchrony: we never assume MPS copy ordering
+    # semantics PyTorch does not document.
+
+    def supports(self, operation: str, dtype: str | None = None) -> bool:
+        if dtype is None and operation in ("pinned_memory", "nccl", "async_copy"):
+            return False
+        if dtype is None and operation == "bfloat16":
+            return self.prober.supports("dtype", "bfloat16")  # depends on macOS version
+        return super().supports(operation, dtype)
 
     def name(self) -> str:
         return f"Apple {platform.machine()} (MPS)"
