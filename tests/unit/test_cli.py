@@ -54,3 +54,18 @@ def test_short_commands_parse():
     assert a.coordinator_address == "k3f9x2@192.168.1.20" and a.device == "mps"
     assert p.parse_args(["start", "--port", "9000"]).port == 9000
     assert p.parse_args(["benchmark"]).func.__name__ == "cmd_cluster_benchmark"
+
+
+def test_capacity_hardware_uses_remembered_cluster(tmp_path, monkeypatch):
+    from meshtrain import cli
+    from meshtrain.experiments import capacity
+
+    monkeypatch.setenv("MESHTRAIN_HOME", str(tmp_path))
+    monkeypatch.delenv("MESHTRAIN_TOKEN", raising=False)
+    monkeypatch.delenv("MESHTRAIN_COORDINATOR", raising=False)
+    cli.save_cluster("10.0.0.5:8080", "secret")
+    seen = {}
+    monkeypatch.setattr(capacity, "run_hardware", lambda client, steps: seen.update(
+        base=client.base, token=client.http.headers["X-MeshTrain-Token"]) or "ok")
+    assert cli.main(["experiment", "capacity", "--mode", "hardware"]) == 0
+    assert seen == {"base": "http://10.0.0.5:8080", "token": "secret"}

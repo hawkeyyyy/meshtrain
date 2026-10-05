@@ -226,13 +226,11 @@ def run_hardware(client, sizes=SIZES, steps: int = 5, write_doc: bool = True, po
     return text
 
 
-def run_experiment5(mode: str = "emulated", cluster_file: str | None = None, steps: int = 5) -> str:
+def run_experiment5(mode: str = "emulated", cluster_file: str | None = None, steps: int = 5,
+                    client=None) -> str:
+    """``client``: a ControlClient for the running cluster (required for hardware mode)."""
     if mode == "emulated":
         return run_emulated(steps=steps)
-    import os
-
-    from meshtrain.networking.control import ControlClient
-
-    client = ControlClient(os.environ.get("MESHTRAIN_COORDINATOR", "127.0.0.1:8080"),
-                           os.environ.get("MESHTRAIN_TOKEN", "meshtrain-dev-token"))
+    if client is None:
+        raise ValueError("hardware mode needs a coordinator client")
     return run_hardware(client, steps=steps)

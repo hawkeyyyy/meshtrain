@@ -372,7 +372,8 @@ def cmd_experiment(args) -> int:
     elif args.name == "capacity":
         from meshtrain.experiments.capacity import run_experiment5
 
-        print(run_experiment5(mode=args.mode, cluster_file=args.cluster, steps=args.steps))
+        client = _client(args) if args.mode == "hardware" else None  # same cluster/token as `meshtrain status`
+        print(run_experiment5(mode=args.mode, cluster_file=args.cluster, steps=args.steps, client=client))
     elif args.name == "transformer":
         from meshtrain.experiments.transformer import run_experiment_transformer
 
