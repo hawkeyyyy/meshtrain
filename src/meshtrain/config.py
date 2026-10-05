@@ -112,7 +112,7 @@ class NetworkConfig(_Strict):
 
 
 class PipelineConfig(_Strict):
-    schedule: Literal["gpipe", "1f1b"] = "gpipe"
+    schedule: Literal["gpipe", "1f1b"] = "1f1b"
     # Cap on microbatch graphs a stage may hold at once (1f1b); None = pipeline depth.
     max_inflight_microbatches: int | None = Field(None, ge=1)
 
