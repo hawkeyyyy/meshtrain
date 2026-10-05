@@ -36,11 +36,13 @@ device, but every kernel still reads only its own local device memory. This is
 | `meshtrain.coordinator` | FastAPI app: worker registry, heartbeat/offline tracking, job state, planning + stage assignment, command queue, metrics sink. **Never runs PyTorch training.** |
 | `meshtrain.worker` | Worker agent: hardware detection, registration, heartbeat thread, command loop, data-plane listener, stage executor. `device.py` holds the device adapters. |
 | `meshtrain.runtime` | Model execution independent of transport: `Stage`, distributed-autograd boundary, GPipe microbatch schedule, `TensorPacket`, tensor (de)serialization. |
-| `meshtrain.networking` | Wire protocol (framing, validation), `Transport` interface with `PipeTransport` (same machine, separate processes) and `TCPTransport`; HTTP control client. Knows nothing about CUDA/MPS. |
+| `meshtrain.networking` | Wire protocol (`protocol.py`: framing, validation), `Transport` interface (`transport.py`) with `PipeTransport` (same machine, separate processes) and `TCPTransport`/`TCPListener` (`tcp.py`); HTTP control client (`control.py`). Knows nothing about CUDA/MPS. |
 | `meshtrain.profiler` | Hardware detection, compute benchmark (`compute_score`), worker-to-worker latency/bandwidth probes. |
 | `meshtrain.planner` | Layer graph profiles (param/activation bytes, FLOPs), cost model, contiguous partition planner, memory accounting. |
 | `meshtrain.models` | Deterministic test models expressed as an ordered list of layers (MLP, tiny Transformer). |
-| `meshtrain.experiments` | Reproducible experiment drivers (correctness, placement, capacity) that write `runs/` and `docs/v1-results.md`. |
+| `meshtrain.experiments` | Reproducible experiment drivers (correctness, placement, capacity, transformer benchmark, recording of cluster runs) that update `docs/v1-results.md`. `emulation.py` provides emulated heterogeneous CPU workers for hosts without a real cluster. |
+| `meshtrain.config`, `telemetry`, `summary` | Validated YAML config (pydantic), structured event logging, `metrics.jsonl` and run summaries. |
+| `meshtrain.future` | Placeholder interfaces only (see below). |
 
 Layering rules: the runtime talks to a `Transport` (bytes in, bytes out) and
 a `DeviceAdapter` (move/synchronize/memory). Transports never see
@@ -191,6 +193,40 @@ dynamic program over contiguous layer ranges and worker orderings minimizing
 the bottleneck stage time subject to every worker's memory budget, using
 boundary activation size as a tie-breaker. `equal` and `compute` strategies
 exist for comparison (Experiment 4).
+
+## Memory accounting
+
+`planner/memory.py` tracks, per stage: parameters, gradients (same size, persistent across
+microbatches), optimizer state (0x for SGD, 2x for Adam/AdamW), saved activations (boundary tensors
+plus the bytes autograd saves for backward, measured on the `meta` device with
+`saved_tensors_hooks`; times the number of microbatches in flight: M for all but the last stage,
+1 for the last stage; times a 1.25 safety factor), and a temporary allowance (2x the largest layer
+output). The reserved headroom is `max(15% of total, 0.5 GB)`. MPS budgets use
+`torch.mps.recommended_max_memory()` because its memory is unified with the OS. At runtime every
+stage reports the same categories from the tensors it actually holds (`Stage.memory_report`, plus
+peak saved bytes counted with the same hooks), along with the device allocator's view
+(`DeviceAdapter.memory_stats`). Example (`MemoryEstimate.format`):
+
+```
+Worker: rtx8
+    total accelerator memory          8.00 GB
+    reserved (headroom)               1.20 GB
+    parameters                        1.10 GB
+    gradients                         1.10 GB
+    optimizer state                   2.20 GB
+    saved activations (est.)          0.40 GB
+    temporary (est.)                  0.05 GB
+```
+
+## Metrics and logs
+
+Every event line carries timestamp, worker, job, step, microbatch and event name. Workers write
+`runs/<job>/events-<worker>.jsonl`. The coordinator appends every stage's per-step record (loss,
+step/forward/backward/communication/idle time, bytes sent and received, lifecycle phase timings,
+memory, utilization, samples/s) to `runs/<job>/metrics.jsonl`. At the end of a job it writes
+`summary.json` and `summary.txt`. Pass `trace: true` in a `START_STAGE` command (or
+`log_microbatch_events`) for per-microbatch `FORWARD_COMPLETE` / `TRANSFER` / `BACKWARD_COMPLETE`
+lines.
 
 ## Failure handling
 

@@ -258,14 +258,32 @@ def cmd_experiment(args) -> int:
     return 0
 
 
+def cmd_results_record(args) -> int:
+    from meshtrain.experiments.record import record_run
+
+    status = None
+    try:
+        status = _client(args).status()
+    except Exception:
+        pass  # coordinator not reachable: record without device names
+    print(record_run(args.run_dir, args.section, reference_steps=args.reference_steps, cluster_status=status))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
+    # --token / --coordinator are accepted both before and after the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--token", default=argparse.SUPPRESS, help="cluster token (default $MESHTRAIN_TOKEN)")
+    common.add_argument("--coordinator", default=argparse.SUPPRESS,
+                        help="coordinator HOST:PORT (default $MESHTRAIN_COORDINATOR or 127.0.0.1:8080)")
     p = argparse.ArgumentParser(prog="meshtrain", description="Heterogeneous pipeline-parallel training (V1)")
-    p.add_argument("--token", help="cluster token (default $MESHTRAIN_TOKEN)")
-    p.add_argument("--coordinator", help="coordinator HOST:PORT (default $MESHTRAIN_COORDINATOR or 127.0.0.1:8080)")
+    # Separate actions (not parents=[common]): set_defaults would mutate the shared actions.
+    p.add_argument("--token", default=None, help="cluster token (default $MESHTRAIN_TOKEN)")
+    p.add_argument("--coordinator", default=None, help="coordinator HOST:PORT")
     sub = p.add_subparsers(dest="command", required=True)
 
     co = sub.add_parser("coordinator").add_subparsers(dest="action", required=True)
-    s = co.add_parser("start")
+    s = co.add_parser("start", parents=[common])
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8080)
     s.add_argument("--runs-dir", default="runs")
@@ -273,7 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_coordinator_start)
 
     wo = sub.add_parser("worker").add_subparsers(dest="action", required=True)
-    j = wo.add_parser("join")
+    j = wo.add_parser("join", parents=[common])
     j.add_argument("coordinator_address")
     j.add_argument("--device", default="auto", help="auto|cuda|mps|cpu")
     j.add_argument("--name")
@@ -284,19 +302,19 @@ def build_parser() -> argparse.ArgumentParser:
     j.set_defaults(func=cmd_worker_join)
 
     cl = sub.add_parser("cluster").add_subparsers(dest="action", required=True)
-    cl.add_parser("status").set_defaults(func=cmd_cluster_status)
-    b = cl.add_parser("benchmark")
+    cl.add_parser("status", parents=[common]).set_defaults(func=cmd_cluster_status)
+    b = cl.add_parser("benchmark", parents=[common])
     b.add_argument("--pings", type=int, default=10)
     b.add_argument("--payload-mb", type=float, default=16.0)
     b.add_argument("--no-network", action="store_true")
     b.add_argument("--output", help="write raw results JSON (input for `experiment placement --cluster`)")
     b.set_defaults(func=cmd_cluster_benchmark)
 
-    pl = sub.add_parser("plan")
+    pl = sub.add_parser("plan", parents=[common])
     pl.add_argument("config")
     pl.set_defaults(func=cmd_plan)
 
-    t = sub.add_parser("train")
+    t = sub.add_parser("train", parents=[common])
     t.add_argument("config")
     t.add_argument("--local", action="store_true", help="run every stage as a local process")
     t.add_argument("--stages", type=int, help="--local: number of equal stages if the config has none")
@@ -304,7 +322,14 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--threads", type=int, default=None, help="--local: torch threads per stage process")
     t.set_defaults(func=cmd_train)
 
-    e = sub.add_parser("experiment")
+    r = sub.add_parser("results").add_subparsers(dest="action", required=True)
+    rr = r.add_parser("record", parents=[common], help="add a finished cluster run to docs/v1-results.md")
+    rr.add_argument("run_dir")
+    rr.add_argument("--section", required=True, help="e.g. experiment2 or experiment3")
+    rr.add_argument("--reference-steps", type=int, default=20)
+    rr.set_defaults(func=cmd_results_record)
+
+    e = sub.add_parser("experiment", parents=[common])
     e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer"])
     e.add_argument("--transport", default="tcp", choices=["pipe", "tcp"])
     e.add_argument("--mode", default="emulated", choices=["emulated", "hardware"],
