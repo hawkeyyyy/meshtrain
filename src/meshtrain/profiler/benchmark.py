@@ -61,6 +61,13 @@ def benchmark_device(adapter: DeviceAdapter, *, matmul_size: int = 1024, iters: 
     def h2d():
         adapter.move_tensor(host)
     h2d_s = _timeit(h2d, adapter, warmup=1, iters=max(3, iters // 2))
+    dev_t = adapter.move_tensor(host)
+
+    def d2h():
+        dev_t.to("cpu")
+    d2h_s = _timeit(d2h, adapter, warmup=1, iters=max(3, iters // 2))
+    nbytes = host.numel() * 4
+    on_host = adapter.backend == "cpu"  # no copy happens at all
     del a, b, x
     return {
         "backend": adapter.backend,
@@ -72,7 +79,11 @@ def benchmark_device(adapter: DeviceAdapter, *, matmul_size: int = 1024, iters: 
         "mlp_forward_s": fwd_s,
         "mlp_backward_s": max(fwd_bwd_s - fwd_s, 0.0),
         "mlp_fwd_bwd_s": fwd_bwd_s,
-        "host_to_device_GBps": host.numel() * 4 / h2d_s / 1e9 if h2d_s > 0 else float("inf"),
+        "host_to_device_GBps": nbytes / h2d_s / 1e9 if h2d_s > 0 else float("inf"),
+        "device_to_host_GBps": nbytes / d2h_s / 1e9 if d2h_s > 0 else float("inf"),
+        # Bytes/s used by the planner's boundary cost (0 = free: CPU tensors need no copy).
+        "h2d_Bps": 0.0 if on_host else nbytes / max(h2d_s, 1e-9),
+        "d2h_Bps": 0.0 if on_host else nbytes / max(d2h_s, 1e-9),
         # Effective FLOP/s used by the planner's cost model (matmul-dominated).
         "measured_flops": gflops * 1e9,
     }

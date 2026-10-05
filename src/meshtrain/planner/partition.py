@@ -22,7 +22,7 @@ import itertools
 import math
 from dataclasses import dataclass, field
 
-from meshtrain.planner.cost import NetworkModel, compute_time, pipeline_step_time
+from meshtrain.planner.cost import NetworkModel, boundary_transfer_time, compute_time, pipeline_step_time
 from meshtrain.planner.graph import LayerProfile
 from meshtrain.planner.memory import (
     DEFAULT_FRAMEWORK_RESERVE,
@@ -44,6 +44,8 @@ class WorkerProfile:
     supported_dtypes: tuple[str, ...] = ("float32", "float16", "bfloat16", "float64")
     compute_score: float = 1.0
     supported_ops: dict | None = None   # dtype -> ops the worker's probes ran (None = unknown)
+    d2h_Bps: float = 0.0                # measured device->host copy rate (0 = no copy, CPU)
+    h2d_Bps: float = 0.0
 
 
 @dataclass
@@ -56,12 +58,14 @@ class StagePlan:
     end: int
     memory: MemoryEstimate
     compute_s: float        # per microbatch, fwd + bwd
-    comm_s: float           # per microbatch, outgoing activation + gradient
+    comm_s: float           # per microbatch, outgoing activation + gradient (D2H + network + H2D)
     boundary_bytes: int     # activation bytes leaving this stage per microbatch
+    overlap: bool = False   # async transport: communication overlaps compute
+    comm_detail: dict = field(default_factory=dict)
 
     @property
     def time_per_mb(self) -> float:
-        return self.compute_s + self.comm_s
+        return max(self.compute_s, self.comm_s) if self.overlap else self.compute_s + self.comm_s
 
 
 @dataclass
@@ -92,8 +96,18 @@ class Plan:
     def communication_s_per_step(self) -> float:
         return sum(self.num_microbatches * s.comm_s for s in self.stages)
 
+    def boundaries(self) -> list[dict]:
+        out = []
+        for a, b in zip(self.stages, self.stages[1:]):
+            fwd = a.comm_detail.get("forward", {})
+            bwd = b.comm_detail.get("backward", {})
+            out.append({"from_stage": a.stage_index, "to_stage": b.stage_index, "activation_bytes": a.boundary_bytes,
+                        "gradient_bytes": a.boundary_bytes, "forward": fwd, "backward": bwd})
+        return out
+
     def to_dict(self) -> dict:
         return {
+            "boundaries": self.boundaries(),
             "strategy": self.strategy,
             "feasible": self.feasible,
             "violations": self.violations,
@@ -105,6 +119,7 @@ class Plan:
             "stages": [{
                 "stage": s.stage_index, "worker_id": s.worker_id, "worker": s.worker_name, "backend": s.backend,
                 "layers": [s.start, s.end], "compute_s_per_mb": s.compute_s, "comm_s_per_mb": s.comm_s,
+                "time_per_mb": s.time_per_mb, "overlap": s.overlap,
                 "boundary_bytes": s.boundary_bytes, "memory": s.memory.to_dict(),
             } for s in self.stages],
         }
@@ -155,6 +170,8 @@ class PlannerOptions:
     framework_reserve: dict = field(default_factory=lambda: dict(DEFAULT_FRAMEWORK_RESERVE))
     budget_overrides: dict = field(default_factory=dict)  # worker_id -> total bytes (startup replanning)
     required_ops: tuple[str, ...] = ()
+    async_transport: bool = False      # stage time = max(compute, comm) instead of the sum
+    tie_tolerance: float = 0.02        # bottlenecks within 2% -> prefer fewer boundary bytes
 
     def memory_kwargs(self, backend: str) -> dict:
         if self.headroom_fraction is not None or self.headroom_min_bytes is not None:
@@ -178,11 +195,14 @@ class _Evaluator:
         flops = self.prefix_flops[end] - self.prefix_flops[start]
         comp = compute_time(flops, w.measured_flops)
         out_bytes = self.layers[end - 1].activation_bytes if not last else 0
-        comm = 0.0
-        if not last:
-            comm += self.network.transfer_time(out_bytes, w.worker_id, workers[idx + 1].worker_id)
-        if idx > 0:
-            comm += self.network.transfer_time(self.layers[start].input_bytes, w.worker_id, workers[idx - 1].worker_id)
+        comm, detail = 0.0, {}
+        if not last:  # forward activation to the next stage
+            detail["forward"] = boundary_transfer_time(out_bytes, w, workers[idx + 1], self.network)
+            comm += detail["forward"]["total_s"]
+        if idx > 0:   # backward activation-gradient to the previous stage
+            detail["backward"] = boundary_transfer_time(self.layers[start].input_bytes, w, workers[idx - 1],
+                                                        self.network)
+            comm += detail["backward"]["total_s"]
         total = self.opts.budget_overrides.get(w.worker_id, w.memory_total)
         mem = estimate_stage_memory(self.layers[start:end], total=total, optimizer=self.opts.optimizer,
                                     num_microbatches=self.opts.num_microbatches, is_last=last,
@@ -190,7 +210,8 @@ class _Evaluator:
                                     max_inflight=self.opts.max_inflight, backend=w.backend,
                                     activation_safety=self.opts.activation_safety,
                                     **self.opts.memory_kwargs(w.backend))
-        return StagePlan(idx, w.worker_id, w.name, w.backend, start, end, mem, comp, comm, out_bytes)
+        return StagePlan(idx, w.worker_id, w.name, w.backend, start, end, mem, comp, comm, out_bytes,
+                         overlap=self.opts.async_transport, comm_detail=detail)
 
 
 def _usable(w: WorkerProfile, opts: PlannerOptions) -> int:
@@ -280,6 +301,15 @@ def plan_compute(layers, workers, network, opts) -> Plan:
     return _plan_from_bounds("compute", ws, bounds, ev, excluded)
 
 
+def _better(a, b, tol: float) -> bool:
+    """(bottleneck, boundary_bytes): clearly faster wins; near-ties go to less traffic."""
+    if b[0] == math.inf:
+        return a[0] < math.inf
+    if a[0] < b[0] * (1 - tol):
+        return True
+    return a[0] <= b[0] * (1 + tol) and a[1] < b[1]
+
+
 def _dp(ev: _Evaluator, ws: list[WorkerProfile]):
     """min over contiguous splits of (bottleneck time, boundary bytes) with memory feasibility."""
     n, k = len(ev.layers), len(ws)
@@ -298,7 +328,7 @@ def _dp(ev: _Evaluator, ws: list[WorkerProfile]):
                 if not st.memory.fits:
                     continue
                 val = (max(prev[0], st.time_per_mb), prev[1] + st.boundary_bytes, i)
-                if val[:2] < cand[:2]:
+                if _better(val, cand, ev.opts.tie_tolerance):
                     cand = val
             best[j][s] = cand
     if best[n][k][0] == math.inf:
@@ -349,7 +379,8 @@ def plan_manual(layers, workers, network, opts, assignments: list[tuple[str, int
     return _plan_from_bounds("manual", ws, [(a, b) for _, a, b in assignments], ev, {})
 
 
-STRATEGIES = {"equal": plan_equal, "compute": plan_compute, "auto": plan_auto}
+# "topology_aware" is the V1.5 name of "auto" (memory + compute + D2H/network/H2D + overlap + boundary size).
+STRATEGIES = {"equal": plan_equal, "compute": plan_compute, "auto": plan_auto, "topology_aware": plan_auto}
 
 
 def make_plan(strategy: str, layers, workers, network: NetworkModel | None = None,

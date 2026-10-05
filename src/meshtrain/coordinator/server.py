@@ -289,6 +289,17 @@ class Coordinator:
         if path.exists():
             s = summarize(read_jsonl(path))
             s["status"], s["error"] = status.value, error
+            if job.plan and s.get("steps"):
+                from meshtrain.planner.report import prediction_accuracy
+
+                mem = {k: {"actual_peak_step0": None} for k in job.memory_reports}
+                for r in read_jsonl(path):
+                    if r.get("event") == "STEP_COMPLETE" and r.get("memory_validation") \
+                            and r.get("attempt", 0) == job.attempt:
+                        mem[str(r["stage"])] = r["memory_validation"]
+                s["prediction_accuracy"] = prediction_accuracy(job.plan, s, mem)
+                (Path(job.run_dir) / "prediction_accuracy.json").write_text(
+                    json.dumps(s["prediction_accuracy"], indent=2, default=str))
             (Path(job.run_dir) / "summary.json").write_text(json.dumps(s, indent=2, default=str))
             (Path(job.run_dir) / "summary.txt").write_text(format_summary(s) + "\n")
             job.summary = s

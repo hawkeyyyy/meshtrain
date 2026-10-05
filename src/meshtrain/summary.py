@@ -9,6 +9,9 @@ from collections import defaultdict
 def summarize(records: list[dict], warmup_steps: int = 1) -> dict:
     """Aggregate STEP_COMPLETE records (one per stage per step)."""
     steps = [r for r in records if r.get("event") == "STEP_COMPLETE"]
+    if steps and any("attempt" in r for r in steps):  # replanned job: summarise the final attempt only
+        last = max(r.get("attempt", 0) for r in steps)
+        steps = [r for r in steps if r.get("attempt", 0) == last]
     if not steps:
         return {"steps": 0}
     by_stage: dict[int, list[dict]] = defaultdict(list)
@@ -31,6 +34,12 @@ def summarize(records: list[dict], warmup_steps: int = 1) -> dict:
             "optimizer_s": mean("optimizer_s"),
             "comm_s": mean("comm_s"),
             "idle_s": mean("idle_s"),
+            "compute_s": mean("compute_s"),
+            "overlapped_s": mean("overlapped_s"),
+            "exposed_communication_s": mean("exposed_communication_s"),
+            "overlap_ratio": mean("overlap_ratio"),
+            "peak_saved_microbatches": max(r.get("memory", {}).get("saved_microbatches_peak", 0) for r in rs_m),
+            "peak_saved_activation_bytes": max(r.get("memory", {}).get("saved_activations_peak", 0) for r in rs_m),
             "utilization": mean("utilization"),
             "bytes_sent_per_step": mean("bytes_sent"),
             "memory": mem,

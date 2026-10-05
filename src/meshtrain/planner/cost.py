@@ -1,25 +1,36 @@
-"""Explicit, documented cost model for pipeline placement.
+"""Explicit, documented cost model for pipeline placement (V1.5).
 
 Notation: S stages, M microbatches per step, layer v, worker i.
 
-    transfer_time(bytes, i->j) = latency[i][j] + bytes / bandwidth[i][j]
+    network(bytes, i->j)   = latency[i][j] + bytes / bandwidth[i][j]
+    transfer(bytes, i->j)  = bytes / d2h[i] + network(bytes, i->j) + bytes / h2d[j]
+        (device -> host staging on the sender, the network, host -> device on
+         the receiver; d2h/h2d are measured by the worker benchmark and are
+         free for CPU workers. CUDA->CUDA and CUDA->MPS therefore differ.)
 
     compute_time[v][i] = flops[v] * (1 + BACKWARD_FACTOR) / measured_flops[i]
         (backward ~ 2x forward FLOPs for matmul-dominated layers)
 
-    stage_time_per_mb[s] = sum_{v in s} compute_time[v][w_s]
-                         + transfer_time(act_bytes[last(s)], w_s -> w_{s+1})   (activation out)
-                         + transfer_time(act_bytes[first(s)-1], w_s -> w_{s-1}) (gradient out)
+    per microbatch, for stage s on worker w_s:
+        compute_s = Σ_{v in s} compute_time[v][w_s]
+        comm_s    = transfer(act_bytes[out(s)],  w_s -> w_{s+1})   forward activation
+                  + transfer(act_bytes[in(s)],   w_s -> w_{s-1})   backward activation-gradient
+        stage_time_s = compute_s + comm_s           blocking transport (V1)
+                     = max(compute_s, comm_s)       async transport: sends overlap compute (V1.5)
 
-    pipeline_step_time  ~= (M + S - 1) * max_s stage_time_per_mb[s]      (GPipe fill + drain)
+    pipeline_step_time ~= (M + S - 1) * max_s stage_time_s   (fill + drain; same for GPipe and 1F1B)
 
-    communication_per_step = sum over boundaries of 2 * M * act_bytes[boundary]
-                             (activation forward + gradient backward)
+    communication_per_step = Σ_boundaries 2 * M * act_bytes[boundary]
 
-The model ignores overlap between compute and communication inside a stage
-(V1 sends synchronously) and assumes link bandwidth is not shared between
-boundaries. ``measured_flops`` comes from the worker's matmul benchmark, so
-small/irregular layers are predicted optimistically.
+Placement ties: when two partitions' bottlenecks are within 2%, the one with
+fewer boundary bytes wins (less traffic, less exposure to bandwidth noise).
+
+Limitations: link bandwidth is assumed not to be shared between boundaries;
+``max(compute, comm)`` assumes perfect overlap (measured overlap ratios in
+the timeline show how far reality is from that); ``measured_flops`` comes
+from a matmul benchmark, so small/irregular layers are predicted
+optimistically. ``prediction_accuracy`` in every run report records
+predicted vs actual stage time and memory so these can be calibrated.
 """
 
 from __future__ import annotations
@@ -62,3 +73,11 @@ def pipeline_step_time(stage_times_per_mb: list[float], num_microbatches: int) -
     if not stage_times_per_mb:
         return 0.0
     return (num_microbatches + len(stage_times_per_mb) - 1) * max(stage_times_per_mb)
+
+
+def boundary_transfer_time(nbytes: float, src, dst, network: NetworkModel) -> dict:
+    """``src``/``dst`` are WorkerProfiles (need worker_id, d2h_Bps, h2d_Bps)."""
+    d2h = nbytes / src.d2h_Bps if src.d2h_Bps else 0.0
+    h2d = nbytes / dst.h2d_Bps if dst.h2d_Bps else 0.0
+    net = network.transfer_time(nbytes, src.worker_id, dst.worker_id)
+    return {"d2h_s": d2h, "network_s": net, "h2d_s": h2d, "total_s": d2h + net + h2d}

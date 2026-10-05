@@ -30,10 +30,15 @@ def worker_profile(w: WorkerRecord) -> WorkerProfile:
     else:  # older worker: static assumptions
         dtypes = ("float32", "float16", "bfloat16") if w.backend == "mps" else \
             ("float32", "float16", "bfloat16", "float64")
-    flops = (w.benchmark or {}).get("measured_flops") or UNBENCHMARKED_FLOPS.get(w.backend, 5e10)
+    bench = w.benchmark or {}
+    flops = bench.get("measured_flops") or UNBENCHMARKED_FLOPS.get(w.backend, 5e10)
+    # device<->host copy rates (unbenchmarked accelerators: assume ~PCIe 3 x8)
+    default_copy = 0.0 if w.backend == "cpu" else 6e9
     return WorkerProfile(w.worker_id, w.name, w.backend, total, float(flops),
                          unified_memory=bool(dev.get("unified_memory")), supported_dtypes=dtypes,
-                         supported_ops=caps.get("op_capabilities"))
+                         supported_ops=caps.get("op_capabilities"),
+                         d2h_Bps=float(bench.get("d2h_Bps", default_copy)),
+                         h2d_Bps=float(bench.get("h2d_Bps", default_copy)))
 
 
 def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: NetworkModel | None = None,
@@ -62,6 +67,7 @@ def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: Network
         safety_factors=cfg.memory.safety_factors(),
         framework_reserve=cfg.memory.framework_reserve_bytes(),
         budget_overrides=dict(budget_overrides or {}),
+        async_transport=cfg.transport.async_,
         required_ops=tuple(spec.required_ops) + (("adamw",) if cfg.training.optimizer in ("adam", "adamw") else ()),
     )
     if pc.strategy == "manual":

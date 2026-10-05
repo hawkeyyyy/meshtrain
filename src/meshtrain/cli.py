@@ -273,6 +273,17 @@ def cmd_plan(args) -> int:
     return 0 if resp["plan"]["feasible"] else 1
 
 
+def cmd_inspect_placement(args) -> int:
+    from meshtrain.config import load_config
+    from meshtrain.planner.report import format_placement
+
+    cfg = load_config(args.config)
+    resp = _client(args).plan(cfg.model_dump(mode="json", by_alias=True))
+    spec = cfg.build_model_spec()
+    print(format_placement(resp["plan"], [spec.layer_name(i) for i in range(spec.num_layers)]))
+    return 0 if resp["plan"]["feasible"] else 1
+
+
 def cmd_train(args) -> int:
     if args.local:
         return _train_local(args)
@@ -459,6 +470,11 @@ def build_parser() -> argparse.ArgumentParser:
     pl = sub.add_parser("plan", parents=[common])
     pl.add_argument("config")
     pl.set_defaults(func=cmd_plan)
+
+    ins = sub.add_parser("inspect").add_subparsers(dest="action", required=True)
+    ip = ins.add_parser("placement", parents=[common], help="detailed placement plan for a config")
+    ip.add_argument("config")
+    ip.set_defaults(func=cmd_inspect_placement)
 
     t = sub.add_parser("train", parents=[common])
     t.add_argument("config")

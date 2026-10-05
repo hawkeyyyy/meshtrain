@@ -42,9 +42,7 @@ def test_async_with_emulated_link_trains_identically():
     a = run_local_pipeline(MLP, stages, s_sync, optimizer="adam", lr=1e-3, link_emulation=(20e6, 0.001))
     b = run_local_pipeline(MLP, stages, s_async, optimizer="adam", lr=1e-3, link_emulation=(20e6, 0.001))
     assert a[0].losses == pytest.approx(b[0].losses, rel=1e-6)
-    # blocking sends can never overlap compute; async ones are measured
-    assert all(m["overlapped_s"] < 1e-3 for r in a for m in r.step_metrics)
-    assert all(m["communication_s"] > 0 for r in b for m in r.step_metrics)
+    assert all(m["communication_s"] > 0 for r in b for m in r.step_metrics)  # transfers are measured
 
 
 class ShufflingTransport(Transport):
@@ -164,8 +162,23 @@ def test_async_overlaps_communication_with_compute():
     sync = run_local_pipeline(cfg, stages, PipelineSettings("s", **common), link_emulation=(5e6, 0.001))
     asyn = run_local_pipeline(cfg, stages, PipelineSettings("a", async_transport=True, **common),
                               link_emulation=(5e6, 0.001))
+    from meshtrain.runtime.timeline import _intersect, _length, _union
+
+    def send_overlap(res):
+        """Seconds of NETWORK_SEND that ran while the same stage was computing."""
+        total = 0.0
+        for r in res:
+            spans = r.timeline
+            comp = _union([(x["start"], x["end"]) for x in spans
+                           if x["category"] in ("FORWARD_COMPUTE", "BACKWARD_COMPUTE")])
+            send = _union([(x["start"], x["end"]) for x in spans if x["category"] == "NETWORK_SEND"])
+            total += _length(_intersect(comp, send))
+        return total
+
     ov = lambda res: sum(m["overlapped_s"] for r in res for m in r.step_metrics[1:])  # noqa: E731
-    ratio = lambda res: max(m["overlap_ratio"] for r in res for m in r.step_metrics[1:])  # noqa: E731
-    assert ov(sync) < 1e-3 and ratio(sync) < 0.01   # blocking sends never overlap
-    assert ov(asyn) > 0.01 and ratio(asyn) > 0.1    # async sends do, and it is measured
+    # Blocking sends run on the compute thread: they can never overlap compute.
+    # (Receives already ran on reader threads in V1, so total overlap is small but not zero.)
+    assert send_overlap(sync) == 0.0
+    assert send_overlap(asyn) > 0.01                # async sends overlap compute, and it is measured
+    assert ov(asyn) > 5 * max(ov(sync), 1e-3)
     assert asyn[0].losses == pytest.approx(sync[0].losses, rel=1e-6)

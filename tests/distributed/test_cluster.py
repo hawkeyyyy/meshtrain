@@ -101,6 +101,10 @@ def test_three_worker_cluster_benchmark_and_training(cluster):
     assert len(b["workers"]) == 3 and len(b["links"]) == 6  # directional i->j
     assert max(r["compute_score"] for r in b["workers"].values()) == 1.0
 
+    from meshtrain.planner.report import format_placement
+
+    plan = client.plan(CFG)["plan"]
+    assert "Boundary 1 -> 2" in format_placement(plan)
     job = client.start_job(CFG)
     assert len(job["plan"]["stages"]) == 3
     j = _wait_job(client, job["job_id"])
@@ -111,6 +115,9 @@ def test_three_worker_cluster_benchmark_and_training(cluster):
     assert set(map(int, s["stages"])) == {0, 1, 2}
     assert s["bytes_per_step"] > 0
     assert os.path.exists(os.path.join(j["run_dir"], "metrics.jsonl"))
+    acc = s["prediction_accuracy"]
+    assert acc["step"]["actual_s"] > 0 and set(map(int, acc["stages"])) == {0, 1, 2}
+    assert os.path.exists(os.path.join(j["run_dir"], "prediction_accuracy.json"))
     # workers are free again
     assert all(w["status"] == "ONLINE" for w in client.status()["workers"])
 

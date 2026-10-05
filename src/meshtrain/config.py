@@ -73,7 +73,8 @@ class StagePlacement(_Strict):
 
 
 class PlacementConfig(_Strict):
-    strategy: Literal["auto", "equal", "compute", "manual"] = "auto"
+    # topology_aware (= auto): memory + compute + D2H/network/H2D + overlap + boundary size
+    strategy: Literal["topology_aware", "auto", "equal", "compute", "manual"] = "topology_aware"
     num_stages: int | None = Field(None, ge=1)  # None = use all eligible workers
     stages: list[StagePlacement] | None = None   # required for manual
     # Reject plans whose memory estimate exceeds a worker's budget. Disable only to
