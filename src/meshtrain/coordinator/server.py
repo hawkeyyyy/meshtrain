@@ -185,7 +185,7 @@ class Coordinator:
 
     def start_job(self, config: dict) -> JobRecord:
         cfg, plan = self.plan(config)
-        if not plan.feasible:
+        if not plan.stages or (not plan.feasible and cfg.placement.enforce_memory_check):
             raise ValueError("placement infeasible:\n" + plan.format())
         job_id = f"{cfg.job.name}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         run_dir = self.runs_dir / job_id

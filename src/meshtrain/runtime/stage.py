@@ -57,6 +57,7 @@ class Stage:
             True for _ in self.module.parameters()) else None
         self.loss_fn = loss_fn
         self.contexts = ContextStore()
+        self._param_ids = {id(p) for p in self.module.parameters()}
         if self.is_last and loss_fn is None:
             raise ValueError("the last stage needs a loss function")
 
@@ -76,7 +77,20 @@ class Stage:
         """
         t0 = time.perf_counter()
         x = make_boundary_input(self.device.move_tensor(inp), requires_grad=not self.is_first)
-        out = self.module(x)
+        param_ids = self._param_ids
+        saved = 0
+
+        def pack(t):
+            nonlocal saved
+            base = t._base if t._base is not None else t
+            if id(t) not in param_ids and id(base) not in param_ids:
+                saved += t.numel() * t.element_size()
+            return t
+
+        # Count what autograd keeps alive for backward (excluding parameters).
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            out = self.module(x)
+        context.autograd_saved_bytes = saved
         self.device.synchronize()
         context.input, context.output = x, out
         context.timings["forward"] = time.perf_counter() - t0
@@ -92,6 +106,7 @@ class Stage:
         if not self.is_last:
             raise BoundaryError("forward_loss is only valid on the last stage")
         out = self.forward(inp, context)
+        context.peak_saved_bytes = self.contexts.saved_bytes()
         t0 = time.perf_counter()
         loss = self.loss_fn(out, self.device.move_tensor(target))
         self.contexts.pop(context.step_id, context.microbatch_id)

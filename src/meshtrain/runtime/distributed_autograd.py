@@ -62,13 +62,15 @@ class MicrobatchContext:
     input: torch.Tensor | None = None
     output: torch.Tensor | None = None
     timings: dict[str, float] = field(default_factory=dict)
+    autograd_saved_bytes: int = 0  # tensors saved for backward inside the stage
+    peak_saved_bytes: int = 0      # all contexts held when this one was created (last stage)
 
     @property
     def key(self) -> tuple[int, int]:
         return (self.step_id, self.microbatch_id)
 
     def saved_bytes(self) -> int:
-        n = 0
+        n = self.autograd_saved_bytes
         for t in (self.input, self.output):
             if t is not None:
                 n += t.numel() * t.element_size()

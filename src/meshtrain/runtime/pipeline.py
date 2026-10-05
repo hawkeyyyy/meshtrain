@@ -211,6 +211,7 @@ def run_stage(
                     ctx = MicrobatchContext(step, mb)
                     if stage.is_last:  # single-stage pipeline
                         loss, _ = stage.forward_loss(xs[mb], ys[mb], ctx, loss_scale=1.0 / M)
+                        stats.peak_saved_bytes = max(stats.peak_saved_bytes, ctx.peak_saved_bytes)
                         loss_sum += float(loss)
                         stats.forward_s += ctx.timings["forward"]
                         stats.backward_s += ctx.timings["backward"]
@@ -273,6 +274,7 @@ def run_stage(
                                                        loss_scale=1.0 / M)
                     stats.forward_s += ctx.timings["forward"]
                     stats.backward_s += ctx.timings["backward"]
+                    stats.peak_saved_bytes = max(stats.peak_saved_bytes, ctx.peak_saved_bytes)
                     loss_val = float(loss)
                     loss_sum += loss_val
                     send(upstream, grad_in, MessageType.BACKWARD_GRADIENT, step, mb, stats,

@@ -76,6 +76,9 @@ class PlacementConfig(_Strict):
     strategy: Literal["auto", "equal", "compute", "manual"] = "auto"
     num_stages: int | None = Field(None, ge=1)  # None = use all eligible workers
     stages: list[StagePlacement] | None = None   # required for manual
+    # Reject plans whose memory estimate exceeds a worker's budget. Disable only to
+    # probe real out-of-memory limits (capacity experiment, hardware mode).
+    enforce_memory_check: bool = True
     memory_headroom_fraction: float = Field(0.15, ge=0, lt=1)
     memory_headroom_min_gb: float = Field(0.5, ge=0)
     # Safety multiplier on the measured autograd-saved bytes (planner/memory.py).

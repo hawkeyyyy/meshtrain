@@ -29,13 +29,15 @@ from meshtrain.telemetry import EventLogger
 class LocalStage:
     layers: tuple[int, int]
     device: str = "cpu"
+    threads: int | None = None  # per-process torch threads (emulates slower/faster CPU workers)
 
 
 def _stage_process(index, stages, model_cfg, seed, settings, optimizer, lr, transport, links,
                    results, capture_params, torch_threads):
     os.environ.setdefault("MESHTRAIN_QUIET", "1")
-    if torch_threads:
-        torch.set_num_threads(torch_threads)
+    threads = stages[index].threads or torch_threads
+    if threads:
+        torch.set_num_threads(threads)
     from meshtrain.worker.device import select_device
 
     up = down = None
