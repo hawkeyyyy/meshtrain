@@ -80,6 +80,8 @@ class PipelineSettings:
     async_transport: bool = False           # False = V1 blocking sends on the compute thread
     max_outbound_queue: int | None = None   # default 2*M + 4 messages per link
     trace: bool = True                      # keep every timeline span (else only the current step)
+    pinned_memory: bool = True              # CUDA: page-locked staging buffers
+    buffer_pool: bool = True                # reuse staging / receive buffers
 
 
 @dataclass
@@ -132,8 +134,8 @@ class Inbox:
             frame_s = getattr(link, "last_frame_s", 0.0)
             tl.add("NETWORK_RECV", end - frame_s, end, packet.step_id, packet.microbatch_id, link=name,
                    bytes=len(packet.payload))
-            tensor = None
-            if packet.has_tensor:
+            tensor = getattr(packet, "recv_buffer", None)  # received in place: nothing to decode
+            if tensor is None and packet.has_tensor:
                 with tl.span("DESERIALIZE", packet.step_id, packet.microbatch_id):
                     tensor = bytes_to_tensor(packet.payload, packet.dtype, packet.shape)
             if not self._put(("packet", name, packet, tensor)):
@@ -145,9 +147,10 @@ class Inbox:
 
 class _StepBuffers:
     def __init__(self):
-        self.acts: dict[int, torch.Tensor] = {}
+        self.acts: dict[int, tuple] = {}          # mb -> (h2d handle, release token)
         self.targets: dict[int, torch.Tensor] = {}
-        self.grads: dict[int, tuple[torch.Tensor, dict]] = {}
+        self.grads: dict[int, tuple] = {}         # mb -> (h2d handle, release token, meta)
+        self.tokens: dict[int, list] = {}         # mb -> buffers to release after its backward
 
 
 def run_stage(
@@ -182,6 +185,11 @@ def run_stage(
     if capture_params:
         result.initial_params = stage.named_parameters_cpu()
     dev = stage.device
+    dev.configure_transfers(pinned=settings.pinned_memory, pool=settings.buffer_pool)
+    _recv_types = (int(MessageType.FORWARD_ACTIVATION), int(MessageType.BACKWARD_GRADIENT))
+    for _link in links.values():  # receive activations/gradients straight into pooled buffers
+        _link.payload_allocator = (lambda mtype, dtype, shape:
+                                   dev.recv_buffer(shape, dtype) if mtype in _recv_types else None)
     future: dict[int, list] = {}          # buffered (link, packet, tensor) for later steps
     st: dict = {}                          # current step state: sm, bufs, step
 
@@ -209,11 +217,11 @@ def run_stage(
         elif mtype == MessageType.FORWARD_ACTIVATION and link == UPSTREAM:
             if mb in bufs.acts:
                 raise BoundaryError(f"duplicate activation for step {packet.step_id} microbatch {mb}")
-            bufs.acts[mb] = tensor
+            bufs.acts[mb] = begin_h2d(tensor, packet.step_id, mb)  # prefetch to the device now
             if not stage.is_last or mb in bufs.targets:
                 sm.on(Event.ACTIVATION_RECEIVED, mb)
         elif mtype == MessageType.BACKWARD_GRADIENT and link == DOWNSTREAM:
-            bufs.grads[mb] = (tensor, dict(packet.meta))
+            bufs.grads[mb] = (*begin_h2d(tensor, packet.step_id, mb), dict(packet.meta))
             sm.on(Event.GRADIENT_RECEIVED, mb)
         else:
             raise BoundaryError(f"unexpected {mtype.name} from {link}")
@@ -273,13 +281,23 @@ def run_stage(
                                 f"waiting for {action}")
         tl.add(cat, t0, tl.now(), step, action.microbatch)
 
-    def h2d(tensor: torch.Tensor, step: int, mb: int) -> torch.Tensor:
+    def begin_h2d(tensor: torch.Tensor, step: int, mb: int):
         if dev.backend == "cpu":
-            return tensor
-        with tl.span("H2D_COPY", step, mb):
-            out = dev.move_tensor(tensor)
-            dev.synchronize()
-        return out
+            return dev.begin_h2d(tensor)
+        with tl.span("H2D_COPY", step, mb, phase="begin"):
+            return dev.begin_h2d(tensor)
+
+    def finish_h2d(entry, step: int, mb: int) -> torch.Tensor:
+        handle, token = entry[0], entry[1]
+        st["bufs"].tokens.setdefault(mb, []).append(token)
+        if dev.backend == "cpu":
+            return dev.finish_h2d(handle)
+        with tl.span("H2D_COPY", step, mb, phase="finish"):
+            return dev.finish_h2d(handle)
+
+    def release_mb(mb: int) -> None:
+        for token in st["bufs"].tokens.pop(mb, []):
+            dev.after_use(token)
 
     try:
         for local_step in range(settings.steps):
@@ -310,7 +328,7 @@ def run_stage(
                             outbox.submit_tensor(DOWNSTREAM, ys[mb], MessageType.TARGET, device=_HOST, step=step,
                                                  microbatch=mb, job_id=settings.job_id, source_worker=worker)
                     else:
-                        inp = h2d(bufs.acts.pop(mb), step, mb)
+                        inp = finish_h2d(bufs.acts.pop(mb), step, mb)
                     ctx = MicrobatchContext(step, mb)
                     sm.on(Event.FORWARD_STARTED, mb)
                     with tl.span("FORWARD_COMPUTE", step, mb):
@@ -333,11 +351,13 @@ def run_stage(
                             loss, grad_in, ctx = stage.loss_backward(target, (step, mb), loss_scale=1.0 / M)
                         meta = {"loss": float(loss)}
                     else:
-                        grad, meta = bufs.grads.pop(mb)
-                        grad = h2d(grad, step, mb)
+                        entry = bufs.grads.pop(mb)
+                        meta = entry[2]
+                        grad = finish_h2d(entry, step, mb)
                         with tl.span("BACKWARD_COMPUTE", step, mb):
                             grad_in, ctx = stage.backward(grad, (step, mb))
                     sm.on(Event.BACKWARD_FINISHED, mb)
+                    release_mb(mb)  # received activation/gradient buffers can be reused now
                     loss_sum += float(meta.get("loss", 0.0))
                     if not stage.is_first:
                         outbox.submit_tensor(UPSTREAM, grad_in, MessageType.BACKWARD_GRADIENT, device=dev,
@@ -380,6 +400,7 @@ def run_stage(
                 "outbound_queue_peak": max(outbox.peak_depth.values(), default=0),
                 "inbound_queue_peak": inbox.peak_depth if inbox else 0,
                 "peak_inflight_microbatches": sm.peak_inflight,
+                "buffer_pool": dev.host_pool.stats(),
                 "utilization": m["compute_s"] / step_s if step_s else 0.0,
                 "memory": {**mem, "device_allocated": dev_mem.get("allocated", 0),
                            "device_peak": dev_mem.get("peak_allocated", 0), "device_total": dev_mem.get("total", 0)},

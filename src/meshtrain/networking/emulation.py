@@ -37,6 +37,15 @@ class EmulatedLink(Transport):
         self._wire = threading.Lock()
 
     @property
+    def payload_allocator(self):
+        return self.inner.payload_allocator
+
+    @payload_allocator.setter
+    def payload_allocator(self, fn):
+        if hasattr(self, "inner"):
+            self.inner.payload_allocator = fn
+
+    @property
     def last_frame_s(self) -> float:
         return getattr(self.inner, "last_frame_s", 0.0)
 

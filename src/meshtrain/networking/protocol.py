@@ -63,15 +63,23 @@ def parse_prefix(prefix: bytes, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYT
     return header_len, payload_len
 
 
-def decode_body(header_bytes: bytes, payload: bytes) -> TensorPacket:
+def parse_header(header_bytes: bytes):
+    """JSON-decode a frame header (field validation happens in packet_from_header)."""
     try:
-        header = json.loads(header_bytes.decode("utf-8"))
+        return json.loads(header_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProtocolError(f"malformed header: {exc}") from exc
+
+
+def packet_from_header(header, payload) -> TensorPacket:
     try:
         return TensorPacket.from_header(header, payload)
     except ValueError as exc:
         raise ProtocolError(str(exc)) from exc
+
+
+def decode_body(header_bytes: bytes, payload: bytes) -> TensorPacket:
+    return packet_from_header(parse_header(header_bytes), payload)
 
 
 def decode_packet(frame: bytes, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> TensorPacket:

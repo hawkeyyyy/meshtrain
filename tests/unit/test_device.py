@@ -64,3 +64,33 @@ def test_mps_adapter_on_hardware():
     assert t.device.type == "mps" and a.memory_stats()["unified"]
     with pytest.raises(TypeError):
         a.move_tensor(torch.randn(2, dtype=torch.float64))
+
+
+def test_cpu_staging_is_zero_copy_and_pooled():
+    a = CPUDeviceAdapter()
+    t = torch.randn(4, 4)
+    cpu, release = a.begin_d2h(t)()
+    assert cpu.data_ptr() == t.data_ptr() and release is None
+    buf = a.recv_buffer((4, 4), torch.float32)
+    handle, token = a.begin_h2d(buf)
+    assert a.finish_h2d(handle) is buf
+    a.after_use(token)
+    assert a.recv_buffer((4, 4), torch.float32) is buf  # reused after backward
+
+
+@pytest.mark.cuda
+def test_cuda_pinned_d2h_and_h2d_round_trip():
+    a = CUDADeviceAdapter()
+    a.configure_transfers(pinned=True, pool=True)
+    x = torch.randn(256, 256, device="cuda")
+    y = x * 2  # queued on the compute stream; begin_d2h must order after it
+    cpu, release = a.begin_d2h(y)()
+    assert cpu.is_pinned() and torch.allclose(cpu, (x * 2).cpu())
+    release()
+    buf = a.recv_buffer((256, 256), torch.float32)
+    buf.copy_(cpu)
+    handle, token = a.begin_h2d(buf)
+    back = a.finish_h2d(handle)
+    assert back.is_cuda and torch.allclose(back, x * 2)
+    a.after_use(token)
+    assert a.host_pool.stats()["allocation_count"] >= 1

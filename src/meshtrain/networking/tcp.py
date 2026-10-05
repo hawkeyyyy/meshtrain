@@ -16,15 +16,18 @@ from meshtrain.networking.protocol import (
     DEFAULT_MAX_PAYLOAD_BYTES,
     PREFIX_SIZE,
     ProtocolError,
-    decode_body,
+    packet_from_header,
+    parse_header,
     parse_prefix,
 )
 from meshtrain.networking.transport import Transport, TransportClosed, TransportTimeout
 from meshtrain.runtime.tensor_packet import MessageType, TensorPacket
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray(n)
+def _recv_exact(sock: socket.socket, n: int, into: memoryview | None = None) -> bytearray | memoryview:
+    """Read exactly ``n`` bytes (into ``into`` when given). Returns the buffer
+    itself -- no extra copy."""
+    buf = into if into is not None else bytearray(n)
     view = memoryview(buf)
     got = 0
     while got < n:
@@ -37,7 +40,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
         if k == 0:
             raise TransportClosed("peer closed the connection")
         got += k
-    return bytes(buf)
+    return buf
 
 
 class TCPTransport(Transport):
@@ -76,10 +79,16 @@ class TCPTransport(Transport):
         t0 = time.perf_counter()
         prefix = _recv_exact(self.sock, PREFIX_SIZE)
         header_len, payload_len = parse_prefix(prefix, self.max_payload_bytes)
-        header = _recv_exact(self.sock, header_len)
-        payload = _recv_exact(self.sock, payload_len) if payload_len else b""
+        header = parse_header(bytes(_recv_exact(self.sock, header_len)))
+        target = self._allocate(header, payload_len)
+        if target is not None:  # receive straight into a reusable buffer
+            payload = _recv_exact(self.sock, payload_len, into=memoryview(target.numpy()).cast("B"))
+        else:
+            payload = _recv_exact(self.sock, payload_len) if payload_len else b""
         self.last_frame_s = time.perf_counter() - t0  # time on the wire once the frame started
-        return decode_body(header, payload), PREFIX_SIZE + header_len + payload_len
+        packet = packet_from_header(header, payload)
+        packet.recv_buffer = target
+        return packet, PREFIX_SIZE + header_len + payload_len
 
     def close(self) -> None:
         try:

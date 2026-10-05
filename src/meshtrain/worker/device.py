@@ -13,16 +13,53 @@ import platform
 import psutil
 import torch
 
+from meshtrain.runtime.buffers import BufferPool
+
 
 class DeviceAdapter(abc.ABC):
     backend: str = "abstract"
 
     def __init__(self, index: int = 0):
         self.index = index
+        self.host_pool = BufferPool(pinned=False, enabled=True)
 
     @property
     @abc.abstractmethod
     def device(self) -> torch.device: ...
+
+    # -- transfer staging ---------------------------------------------------
+    # The runtime moves tensors across the explicit network boundary with:
+    #   send:    begin_d2h (compute thread) -> finish() (sender thread)
+    #   receive: recv_buffer (reader thread) -> begin_h2d (compute thread, early)
+    #            -> finish_h2d (just before use) -> after_use (after backward)
+    # Defaults are synchronous and correct for any backend; CUDA overrides
+    # them with pinned buffers, a transfer stream and events.
+
+    def configure_transfers(self, pinned: bool = True, pool: bool = True) -> None:
+        self.host_pool = BufferPool(pinned=pinned and self.supports("pinned_memory"), enabled=pool)
+
+    def recv_buffer(self, shape, dtype: torch.dtype) -> torch.Tensor:
+        """Host tensor to receive a payload into (from the pool when enabled)."""
+        return self.host_pool.acquire(shape, dtype)
+
+    def begin_h2d(self, host: torch.Tensor):
+        """Start moving a received host tensor to the device.
+
+        Returns ``(handle, token)``: ``finish_h2d(handle)`` gives the device
+        tensor; ``after_use(token)`` is called once the microbatch no longer
+        needs it. Default: synchronous copy, host buffer back to the pool.
+        """
+        t = self.move_tensor(host)
+        self.synchronize()
+        self.host_pool.release(host)
+        return t, None
+
+    def finish_h2d(self, handle) -> torch.Tensor:
+        return handle
+
+    def after_use(self, token) -> None:
+        if token is not None:
+            self.host_pool.release(token)
 
     def move_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self.supports_dtype(tensor.dtype):
@@ -99,6 +136,11 @@ class CPUDeviceAdapter(DeviceAdapter):
         t = tensor.detach()
         return lambda: (t, None)
 
+    def begin_h2d(self, host: torch.Tensor):
+        # The received buffer *is* the device tensor; it returns to the pool
+        # only after the microbatch's backward (it is saved for backward).
+        return host, host
+
     def name(self) -> str:
         return platform.processor() or platform.machine() or "cpu"
 
@@ -120,10 +162,28 @@ class CPUDeviceAdapter(DeviceAdapter):
 class CUDADeviceAdapter(DeviceAdapter):
     backend = "cuda"
 
+    """CUDA transfers (see docs/performance.md):
+
+    * D2H: the compute thread records an event on the compute stream; the
+      sender thread makes a dedicated *transfer stream* wait for that event,
+      copies into a pinned pool buffer (non_blocking) and waits only for its
+      own copy. Compute kernels queued meanwhile keep running.
+    * H2D: as soon as a payload arrives the compute thread enqueues a
+      non_blocking copy from the pinned buffer on the transfer stream and
+      records an event; just before use the compute stream waits on that
+      event (``wait_event``), and the host buffer returns to the pool only
+      when the copy's event has completed.
+    * ``record_stream`` marks cross-stream tensors so the caching allocator
+      never reuses their memory early.
+    """
+
     def __init__(self, index: int = 0):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA requested but torch.cuda.is_available() is False")
         super().__init__(index)
+        self.host_pool = BufferPool(pinned=True, enabled=True)
+        with torch.cuda.device(index):
+            self.transfer_stream = torch.cuda.Stream()
 
     @property
     def device(self) -> torch.device:
@@ -131,6 +191,41 @@ class CUDADeviceAdapter(DeviceAdapter):
 
     def synchronize(self) -> None:
         torch.cuda.synchronize(self.device)
+
+    def begin_d2h(self, tensor: torch.Tensor):
+        t = tensor.detach()
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+
+        def finish():
+            with torch.cuda.device(self.index):
+                buf = self.host_pool.acquire(t.shape, t.dtype)
+                with torch.cuda.stream(self.transfer_stream):
+                    self.transfer_stream.wait_event(ready)
+                    buf.copy_(t, non_blocking=buf.is_pinned())
+                    done = torch.cuda.Event()
+                    done.record(self.transfer_stream)
+                done.synchronize()
+            return buf, (lambda: self.host_pool.release(buf))
+
+        return finish
+
+    def begin_h2d(self, host: torch.Tensor):
+        if not self.supports_dtype(host.dtype):
+            raise TypeError(f"cuda does not support dtype {host.dtype}")
+        with torch.cuda.device(self.index), torch.cuda.stream(self.transfer_stream):
+            t = host.to(self.device, non_blocking=host.is_pinned())
+            ev = torch.cuda.Event()
+            ev.record(self.transfer_stream)
+        self.host_pool.release(host, ev)  # reusable once the copy has finished
+        return (t, ev), None
+
+    def finish_h2d(self, handle) -> torch.Tensor:
+        t, ev = handle
+        compute = torch.cuda.current_stream(self.device)
+        compute.wait_event(ev)
+        t.record_stream(compute)
+        return t
 
     def name(self) -> str:
         return torch.cuda.get_device_name(self.index)

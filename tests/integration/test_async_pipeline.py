@@ -132,3 +132,25 @@ def test_stall_produces_state_dump():
     for key in ("next_action", "saved_contexts", "pending_sends", "microbatches"):
         assert key in msg
     peer.close()
+
+
+def test_receive_buffers_are_reused_after_warmup():
+    stages = [LocalStage((0, 2)), LocalStage((2, 5)), LocalStage((5, 7))]
+    s = PipelineSettings("buf", steps=6, batch_size=32, num_microbatches=4, async_transport=True,
+                         schedule="1f1b", capture_gradients_at_step=0)
+    res = run_local_pipeline(MLP, stages, s, transport="tcp")
+    mid = res[1].step_metrics
+    allocs = [m["buffer_pool"]["allocation_count"] for m in mid]
+    assert allocs[-1] == allocs[1], allocs          # no new allocations after warm-up
+    assert mid[-1]["buffer_pool"]["reuse_count"] > 0
+    _, ref, _ = reference_step(MLP, s)
+    rows = compare_gradients(ref, _dist_grads(stages, res))
+    assert max(r.relative for r in rows) < 1e-6     # reuse never corrupts saved activations
+
+
+def test_buffer_pool_can_be_disabled():
+    stages = [LocalStage((0, 3)), LocalStage((3, 7))]
+    s = PipelineSettings("nobuf", steps=3, batch_size=16, num_microbatches=2, async_transport=True,
+                         buffer_pool=False)
+    res = run_local_pipeline(MLP, stages, s, transport="tcp")
+    assert res[1].step_metrics[-1]["buffer_pool"]["reuse_count"] == 0

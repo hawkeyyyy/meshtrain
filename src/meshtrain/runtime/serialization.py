@@ -73,7 +73,9 @@ def bytes_to_tensor(payload: bytes, dtype: str, shape: tuple[int, ...]) -> torch
     torch_dtype = NAME_TO_DTYPE[dtype]
     if len(payload) == 0:
         return torch.empty(shape, dtype=torch_dtype)
-    buf = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+    # A bytearray received for this tensor alone can back it directly (no copy).
+    owned = payload if isinstance(payload, bytearray) else bytearray(payload)
+    buf = torch.frombuffer(owned, dtype=torch.uint8)
     return buf.view(torch_dtype).reshape(shape)
 
 

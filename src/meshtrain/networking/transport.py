@@ -18,6 +18,7 @@ and ``recv_packet``.
 from __future__ import annotations
 
 import abc
+import math
 import threading
 import time
 
@@ -33,7 +34,7 @@ from meshtrain.networking.protocol import (
     parse_prefix,
 )
 from meshtrain.runtime.serialization import TensorLifecycle, packet_to_tensor, tensor_to_packet
-from meshtrain.runtime.tensor_packet import MessageType, TensorPacket
+from meshtrain.runtime.tensor_packet import NAME_TO_DTYPE, MessageType, TensorPacket
 
 
 class TransportError(RuntimeError):
@@ -56,6 +57,29 @@ class Transport(abc.ABC):
         self.bytes_sent = 0
         self.bytes_received = 0
         self._send_lock = threading.Lock()
+        # Optional ``fn(message_type, dtype_name, shape) -> CPU tensor | None``
+        # supplying a buffer to receive a tensor payload into (buffer reuse).
+        # Transports that cannot receive in place simply ignore it.
+        self.payload_allocator = None
+
+    def _allocate(self, header, payload_len: int):
+        """Ask ``payload_allocator`` for a buffer exactly matching an (untrusted)
+        header; anything inconsistent falls back to normal (validated) decoding."""
+        fn = self.payload_allocator
+        if fn is None or not payload_len or not isinstance(header, dict):
+            return None
+        dtype, shape, mtype = header.get("dtype"), header.get("shape"), header.get("message_type")
+        if dtype not in NAME_TO_DTYPE or not isinstance(shape, list) or len(shape) > 16 or not all(
+                isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape):
+            return None
+        torch_dtype = NAME_TO_DTYPE[dtype]
+        if math.prod(shape) * torch.empty((), dtype=torch_dtype).element_size() != payload_len:
+            return None
+        buf = fn(mtype, torch_dtype, tuple(shape))
+        if buf is None or buf.device.type != "cpu" or not buf.is_contiguous() \
+                or buf.numel() * buf.element_size() != payload_len:
+            return None
+        return buf
 
     # -- raw frames -------------------------------------------------------
     @abc.abstractmethod

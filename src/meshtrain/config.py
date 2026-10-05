@@ -154,7 +154,8 @@ class MeshTrainConfig(_Strict):
                   num_microbatches=self.training.num_microbatches, timeout_s=self.network.timeout_s,
                   log_every=self.training.log_every, schedule=self.pipeline.schedule,
                   max_inflight_microbatches=self.pipeline.max_inflight_microbatches,
-                  async_transport=self.transport.async_, max_outbound_queue=self.transport.max_outbound_queue)
+                  async_transport=self.transport.async_, max_outbound_queue=self.transport.max_outbound_queue,
+                  pinned_memory=self.transport.pinned_memory, buffer_pool=self.transport.buffer_pool)
         kw.update(overrides)
         return PipelineSettings(**kw)
 
