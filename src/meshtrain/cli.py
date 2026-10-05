@@ -1,5 +1,14 @@
 """``meshtrain`` command-line interface.
 
+Simple form:
+
+    meshtrain start                   # first machine: coordinator + worker, prints a join code
+    meshtrain join TOKEN@HOST         # every other machine
+    meshtrain status | benchmark | train CONFIG
+
+The last cluster started or joined is remembered in ~/.meshtrain/cluster.json.
+Explicit form:
+
     meshtrain coordinator start [--port 8080]
     meshtrain worker join HOST:PORT [--device cuda|mps|cpu] [--name NAME]
     meshtrain cluster status
@@ -9,8 +18,8 @@
     meshtrain train CONFIG --local    # every stage as a local process (no coordinator)
     meshtrain experiment correctness|placement|capacity
 
-Coordinator address and token default to $MESHTRAIN_COORDINATOR and
-$MESHTRAIN_TOKEN.
+Coordinator address and token come from --coordinator/--token, then
+$MESHTRAIN_COORDINATOR/$MESHTRAIN_TOKEN, then the remembered cluster.
 """
 
 from __future__ import annotations
@@ -24,10 +33,63 @@ import time
 import yaml
 
 DEFAULT_TOKEN = "meshtrain-dev-token"
+DEFAULT_PORT = 8080
+
+
+# -- remembered cluster (~/.meshtrain/cluster.json) ------------------------
+def _state_path() -> str:
+    home = os.environ.get("MESHTRAIN_HOME") or os.path.join(os.path.expanduser("~"), ".meshtrain")
+    return os.path.join(home, "cluster.json")
+
+
+def load_saved() -> dict:
+    try:
+        with open(_state_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cluster(coordinator: str, token: str) -> None:
+    path = _state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"coordinator": coordinator, "token": token}, f)
+    try:
+        os.chmod(path, 0o600)  # holds the cluster token
+    except OSError:
+        pass
+
+
+def parse_join_target(target: str) -> tuple[str, str | None]:
+    """``TOKEN@HOST[:PORT]`` or ``HOST[:PORT]`` -> ("HOST:PORT", token or None)."""
+    token = None
+    if "@" in target:
+        token, target = target.rsplit("@", 1)
+        token = token or None
+    target = target.removeprefix("http://")
+    if not target:
+        raise ValueError("missing coordinator address")
+    if ":" not in target:
+        target = f"{target}:{DEFAULT_PORT}"
+    return target, token
+
+
+def lan_ip() -> str:
+    """Best guess of this machine's LAN address (no packets are sent)."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            return s.getsockname()[0]
+    except OSError:
+        return socket.gethostbyname(socket.gethostname())
 
 
 def _token(args) -> str:
-    tok = args.token or os.environ.get("MESHTRAIN_TOKEN")
+    tok = args.token or os.environ.get("MESHTRAIN_TOKEN") or load_saved().get("token")
     if not tok:
         print(f"warning: no --token / $MESHTRAIN_TOKEN given, using the insecure default {DEFAULT_TOKEN!r}",
               file=sys.stderr)
@@ -38,7 +100,9 @@ def _token(args) -> str:
 def _client(args):
     from meshtrain.networking.control import ControlClient
 
-    return ControlClient(args.coordinator or os.environ.get("MESHTRAIN_COORDINATOR", "127.0.0.1:8080"), _token(args))
+    address = (args.coordinator or os.environ.get("MESHTRAIN_COORDINATOR") or load_saved().get("coordinator")
+               or f"127.0.0.1:{DEFAULT_PORT}")
+    return ControlClient(address, _token(args))
 
 
 def _gb(n) -> str:
@@ -54,14 +118,14 @@ def cmd_coordinator_start(args) -> int:
     return 0
 
 
-def cmd_worker_join(args) -> int:
+def _run_worker(args, address: str, token: str) -> int:
     from meshtrain.worker.worker import WorkerAgent
 
-    agent = WorkerAgent(args.coordinator_address, _token(args), device=args.device, name=args.name,
+    agent = WorkerAgent(address, token, device=args.device, name=args.name,
                         data_port=args.data_port, advertise_host=args.advertise_host, runs_dir=args.runs_dir,
                         quick_benchmark=args.quick_benchmark)
     print(f"MeshTrain worker {agent.name}: backend={agent.device.backend} device={agent.device.name()} "
-          f"data-plane port={agent.dataplane.port}", flush=True)
+          f"data-plane port={agent.dataplane.port}  (Ctrl-C to leave)", flush=True)
     try:
         agent.run_forever()
     except KeyboardInterrupt:
@@ -69,6 +133,64 @@ def cmd_worker_join(args) -> int:
     finally:
         agent.stop()
     return 0
+
+
+def cmd_worker_join(args) -> int:
+    address, code_token = parse_join_target(args.coordinator_address)
+    token = args.token or code_token or os.environ.get("MESHTRAIN_TOKEN") or load_saved().get("token")
+    if not token:
+        print("error: no cluster token. Use the join code printed by `meshtrain start` "
+              "(meshtrain join TOKEN@HOST) or pass --token.", file=sys.stderr)
+        return 2
+    save_cluster(address, token)  # so `meshtrain status` / `train` work here without flags
+    return _run_worker(args, address, token)
+
+
+def cmd_start(args) -> int:
+    """Coordinator (subprocess) + a worker for this machine, with a generated token."""
+    import secrets
+    import subprocess
+
+    from meshtrain.networking.control import ControlClient, ControlError
+
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes, never starts with "-"
+    token = (args.token or os.environ.get("MESHTRAIN_TOKEN")
+             or "".join(secrets.choice(alphabet) for _ in range(10)))
+    env = {**os.environ, "MESHTRAIN_TOKEN": token}
+    coord = subprocess.Popen([sys.executable, "-m", "meshtrain.cli", "coordinator", "start", "--host", args.host,
+                              "--port", str(args.port), "--runs-dir", args.runs_dir], env=env)
+    local = f"127.0.0.1:{args.port}"
+    client = ControlClient(local, token)
+    for _ in range(100):
+        if coord.poll() is not None:
+            print(f"error: coordinator exited (is port {args.port} already in use?)", file=sys.stderr)
+            return 1
+        try:
+            client.status()
+            break
+        except ControlError:
+            time.sleep(0.1)
+    save_cluster(local, token)
+    host = args.advertise_host or lan_ip()
+    args.advertise_host = host  # remote stages must dial this machine's LAN address, not 127.0.0.1
+    port_part = "" if args.port == DEFAULT_PORT else f":{args.port}"
+    print(f"\nMeshTrain cluster started.\n\n  On every other machine run:\n\n"
+          f"      meshtrain join {token}@{host}{port_part}\n\n"
+          f"  Then, on any machine in the cluster:\n"
+          f"      meshtrain status\n      meshtrain train configs/local_cpu.yaml\n", flush=True)
+    try:
+        if args.no_worker:
+            coord.wait()
+            return coord.returncode or 0
+        return _run_worker(args, local, token)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        coord.terminate()
+        try:
+            coord.wait(10)
+        except subprocess.TimeoutExpired:
+            coord.kill()
 
 
 # -- cluster -----------------------------------------------------------------
@@ -290,25 +412,45 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--heartbeat-timeout", type=float, default=15.0)
     s.set_defaults(func=cmd_coordinator_start)
 
+    def worker_args(j):
+        j.add_argument("--device", default="auto", help="auto|cuda|mps|cpu")
+        j.add_argument("--name", help="worker name (default: hostname)")
+        j.add_argument("--data-port", type=int, default=29500, help="data-plane TCP port (0 = any)")
+        j.add_argument("--advertise-host", help="address peers should use to reach this machine")
+        j.add_argument("--runs-dir", default="runs")
+        j.add_argument("--quick-benchmark", action="store_true")
+
+    # Short forms: `meshtrain start`, `meshtrain join CODE`, `meshtrain status`, `meshtrain benchmark`.
+    st = sub.add_parser("start", parents=[common],
+                        help="start a cluster on this machine (coordinator + local worker) and print the join code")
+    worker_args(st)
+    st.add_argument("--host", default="0.0.0.0", help="coordinator bind address")
+    st.add_argument("--port", type=int, default=DEFAULT_PORT)
+    st.add_argument("--no-worker", action="store_true", help="run only the coordinator here")
+    st.set_defaults(func=cmd_start)
+
+    jn = sub.add_parser("join", parents=[common], help="join a cluster: meshtrain join TOKEN@HOST[:PORT]")
+    jn.add_argument("coordinator_address", metavar="TOKEN@HOST[:PORT]")
+    worker_args(jn)
+    jn.set_defaults(func=cmd_worker_join)
+
+    sub.add_parser("status", parents=[common], help="show cluster workers").set_defaults(func=cmd_cluster_status)
+
     wo = sub.add_parser("worker").add_subparsers(dest="action", required=True)
     j = wo.add_parser("join", parents=[common])
-    j.add_argument("coordinator_address")
-    j.add_argument("--device", default="auto", help="auto|cuda|mps|cpu")
-    j.add_argument("--name")
-    j.add_argument("--data-port", type=int, default=29500, help="data-plane TCP port (0 = any)")
-    j.add_argument("--advertise-host", help="address peers should use to reach this worker")
-    j.add_argument("--runs-dir", default="runs")
-    j.add_argument("--quick-benchmark", action="store_true")
+    j.add_argument("coordinator_address", metavar="[TOKEN@]HOST[:PORT]")
+    worker_args(j)
     j.set_defaults(func=cmd_worker_join)
 
     cl = sub.add_parser("cluster").add_subparsers(dest="action", required=True)
     cl.add_parser("status", parents=[common]).set_defaults(func=cmd_cluster_status)
-    b = cl.add_parser("benchmark", parents=[common])
-    b.add_argument("--pings", type=int, default=10)
-    b.add_argument("--payload-mb", type=float, default=16.0)
-    b.add_argument("--no-network", action="store_true")
-    b.add_argument("--output", help="write raw results JSON (input for `experiment placement --cluster`)")
-    b.set_defaults(func=cmd_cluster_benchmark)
+    for b in (cl.add_parser("benchmark", parents=[common]),
+              sub.add_parser("benchmark", parents=[common], help="measure compute and network of the cluster")):
+        b.add_argument("--pings", type=int, default=10)
+        b.add_argument("--payload-mb", type=float, default=16.0)
+        b.add_argument("--no-network", action="store_true")
+        b.add_argument("--output", help="write raw results JSON (input for `experiment placement --cluster`)")
+        b.set_defaults(func=cmd_cluster_benchmark)
 
     pl = sub.add_parser("plan", parents=[common])
     pl.add_argument("config")
