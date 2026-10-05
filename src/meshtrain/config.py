@@ -79,8 +79,9 @@ class PlacementConfig(_Strict):
     # Reject plans whose memory estimate exceeds a worker's budget. Disable only to
     # probe real out-of-memory limits (capacity experiment, hardware mode).
     enforce_memory_check: bool = True
-    memory_headroom_fraction: float = Field(0.15, ge=0, lt=1)
-    memory_headroom_min_gb: float = Field(0.5, ge=0)
+    # Deprecated V1 margin; used only when set explicitly (otherwise see ``memory:``).
+    memory_headroom_fraction: float | None = Field(None, ge=0, lt=1)
+    memory_headroom_min_gb: float | None = Field(None, ge=0)
     # Safety multiplier on the measured autograd-saved bytes (planner/memory.py).
     activation_overhead_factor: float = Field(1.25, ge=1)
 
@@ -97,6 +98,29 @@ class PlacementConfig(_Strict):
                     raise ValueError("manual stages must be contiguous and ordered")
                 prev_end = s.layers[1]
         return self
+
+
+class MemoryConfig(_Strict):
+    """Planner safety margins and runtime memory validation (planner/memory.py)."""
+
+    # Fraction of detected device memory the planner may use.
+    safety_factor: float = Field(0.85, gt=0, le=1)
+    # Per-backend overrides of safety_factor (unified-memory MPS shares RAM with the OS).
+    backend_safety_factor: dict[str, float] = {"mps": 0.80}
+    # Memory the framework itself takes before any tensor (CUDA context, cuBLAS workspace).
+    framework_reserve_gb: dict[str, float] = {"cuda": 0.4, "mps": 0.0, "cpu": 0.25}
+    validate_runtime_usage: bool = True   # measure actual memory after materialising a stage
+    probe_allocation: bool = True         # accelerators: allocate the estimated remainder once at startup
+    max_replans: int = Field(2, ge=0)     # startup OOM -> replan with the measured budget, at most N times
+    replan_shrink: float = Field(0.85, gt=0, lt=1)  # extra margin applied to a failed worker's budget
+
+    def safety_factors(self) -> dict[str, float]:
+        out = {b: self.safety_factor for b in ("cuda", "mps", "cpu")}
+        out.update(self.backend_safety_factor)
+        return out
+
+    def framework_reserve_bytes(self) -> dict[str, int]:
+        return {b: int(v * 1024**3) for b, v in self.framework_reserve_gb.items()}
 
 
 class WorkersConfig(_Strict):
@@ -137,6 +161,7 @@ class MeshTrainConfig(_Strict):
     network: NetworkConfig = NetworkConfig()
     pipeline: PipelineConfig = PipelineConfig()
     transport: TransportConfig = TransportConfig()
+    memory: MemoryConfig = MemoryConfig()
 
     @model_validator(mode="after")
     def _check(self):

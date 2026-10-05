@@ -176,12 +176,13 @@ class Coordinator:
         return NetworkModel.from_measurements(self.benchmark.get("links", {}))
 
     # -- jobs -------------------------------------------------------------
-    def plan(self, config: dict):
+    def plan(self, config: dict, budget_overrides: dict | None = None, extra_workers: list | None = None):
         cfg = parse_config(config)
         workers = [w for w in self.registry.online() if w.status == WorkerStatus.ONLINE]
+        workers += [w for w in (extra_workers or []) if w not in workers]
         if not workers:
             raise ValueError("no idle online workers")
-        return cfg, plan_job(cfg, workers, self.network_model())
+        return cfg, plan_job(cfg, workers, self.network_model(), budget_overrides=budget_overrides)
 
     def start_job(self, config: dict) -> JobRecord:
         cfg, plan = self.plan(config)
@@ -190,31 +191,87 @@ class Coordinator:
         job_id = f"{cfg.job.name}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         run_dir = self.runs_dir / job_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False))
-        layer_names = [cfg.build_model_spec().layer_name(i) for i in range(cfg.model_num_layers())]
-        (run_dir / "plan.txt").write_text(plan.format(layer_names) + "\n")
-        (run_dir / "plan.json").write_text(json.dumps(plan.to_dict(), indent=2))
-        job = JobRecord(job_id, cfg.model_dump(mode="json"), plan.to_dict(), run_dir=str(run_dir),
-                        stage_workers=[s.worker_id for s in plan.stages])
+        (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg.model_dump(mode="json", by_alias=True),
+                                                            sort_keys=False))
+        job = JobRecord(job_id, cfg.model_dump(mode="json", by_alias=True), plan.to_dict(), run_dir=str(run_dir))
         self._writers[job_id] = MetricsWriter(run_dir / "metrics.jsonl")
         with self._lock:
             self.jobs[job_id] = job
-            for i, s in enumerate(plan.stages):
-                w = self.registry.get(s.worker_id)
-                w.status, w.current_job = WorkerStatus.BUSY, job_id
             job.status = JobStatus.RUNNING
+            self._launch(job, cfg, plan)
+        return job
+
+    def _launch(self, job: JobRecord, cfg, plan) -> None:
+        """Start one placement attempt (caller holds the lock)."""
+        run_dir = Path(job.run_dir)
+        layer_names = [cfg.build_model_spec().layer_name(i) for i in range(cfg.model_num_layers())]
+        (run_dir / "plan.txt").write_text(plan.format(layer_names) + "\n")
+        (run_dir / "plan.json").write_text(json.dumps(plan.to_dict(), indent=2))
+        job.plan = plan.to_dict()
+        job.stage_workers = [s.worker_id for s in plan.stages]
+        job.stages_done = {}
+        job.attempts.append({"attempt": job.attempt, "placement": [
+            {"worker": s.worker_id, "layers": [s.start, s.end], "estimated_required": s.memory.required,
+             "usable": s.memory.usable} for s in plan.stages], "budget_overrides": dict(job.budget_overrides)})
+        (run_dir / "placement_attempts.json").write_text(json.dumps(job.attempts, indent=2))
+        data_job = job.job_id if job.attempt == 0 else f"{job.job_id}.a{job.attempt}"
+        for s in plan.stages:
+            w = self.registry.get(s.worker_id)
+            w.status, w.current_job = WorkerStatus.BUSY, job.job_id
         n = len(plan.stages)
         for i, s in enumerate(plan.stages):
             nxt = self.registry.get(plan.stages[i + 1].worker_id) if i + 1 < n else None
             self.registry.send(s.worker_id, {
-                "type": "START_STAGE", "job_id": job_id, "config": job.config, "stage_index": i,
-                "num_stages": n, "layers": [s.start, s.end],
+                "type": "START_STAGE", "job_id": job.job_id, "attempt": job.attempt, "data_job_id": data_job,
+                "config": job.config, "stage_index": i, "num_stages": n, "layers": [s.start, s.end],
+                "memory_estimate": s.memory.to_dict(),
                 "downstream": {"host": nxt.data_host, "port": nxt.data_port, "worker_id": nxt.worker_id} if nxt else None,
                 "upstream_worker": plan.stages[i - 1].worker_id if i > 0 else None,
             })
-        self.log.log("JOB_STARTED", None, None, job_id=job_id,
+        self.log.log("JOB_STARTED", None, None, job_id=job.job_id, attempt=job.attempt,
                      placement=" | ".join(f"{s.worker_name}:{s.start}-{s.end - 1}" for s in plan.stages))
-        return job
+
+    def _replan(self, job: JobRecord, worker_id: str, data: dict) -> bool:
+        """Startup OOM on ``worker_id``: shrink its budget to what it measured, plan again.
+
+        Returns False when retries are exhausted or no placement fits."""
+        cfg = parse_config(job.config)
+        if job.attempt >= cfg.memory.max_replans:
+            return False
+        w = self.registry.get(worker_id)
+        backend = w.backend if w else "cuda"
+        sf = cfg.memory.safety_factors().get(backend, cfg.memory.safety_factor)
+        fw = cfg.memory.framework_reserve_bytes().get(backend, 0)
+        stage_plan = next((s for s in job.plan["stages"] if s["worker_id"] == worker_id), None)
+        prev_total = job.budget_overrides.get(worker_id) or (stage_plan["memory"]["total"] if stage_plan else 0)
+        shrink = cfg.memory.replan_shrink
+        new_total = int(prev_total * shrink)
+        report = data.get("memory_report") or {}
+        if report.get("capacity"):
+            # make the planner's usable budget equal to what the device really offered, with margin
+            new_total = min(new_total, int((report["capacity"] * shrink + fw) / sf))
+        job.attempts[-1]["failure"] = {"worker": worker_id, "error": data.get("error"), "memory_report": report}
+        job.budget_overrides[worker_id] = new_total
+        # stop what is left of this attempt and free its workers for the next one
+        for wid in job.stage_workers:
+            self.registry.send(wid, {"type": "STOP_JOB", "job_id": job.job_id, "attempt": job.attempt,
+                                     "reason": "replanning after startup OOM"})
+        own = [self.registry.get(wid) for wid in job.stage_workers]
+        self._release(job)
+        try:
+            cfg, plan = self.plan(job.config, job.budget_overrides,
+                                  extra_workers=[x for x in own if x and x.status != WorkerStatus.OFFLINE])
+        except ValueError:
+            return False
+        if not plan.stages or not plan.feasible:
+            job.attempts[-1]["replan_result"] = plan.format()
+            (Path(job.run_dir) / "placement_attempts.json").write_text(json.dumps(job.attempts, indent=2, default=str))
+            return False
+        job.attempt += 1
+        self.log.log("JOB_REPLANNED", job_id=job.job_id, attempt=job.attempt, worker=worker_id,
+                     new_budget_gb=round(new_total / 1024**3, 3))
+        self._launch(job, cfg, plan)
+        return True
 
     def _release(self, job: JobRecord) -> None:
         for wid in job.stage_workers:
@@ -264,9 +321,15 @@ class Coordinator:
         if job is None:
             return
         with self._lock:
+            if int(d.get("attempt", job.attempt)) != job.attempt:
+                return  # late event from a superseded placement attempt
             if ev.type == "stage_metrics":
                 rec = d["record"]
+                rec["attempt"] = job.attempt
                 self._writers[job.job_id].write(rec)
+                if rec.get("event") == "MEMORY_VALIDATION":
+                    job.memory_reports[str(rec["stage"])] = rec
+                    return
                 job.last_metrics[rec["stage"]] = rec
                 if "loss" in rec:
                     job.losses.append((rec["step"], rec["loss"]))
@@ -276,7 +339,13 @@ class Coordinator:
                     self.log.log("JOB_COMPLETED", job_id=job.job_id)
                     self._finish(job, JobStatus.COMPLETED)
             elif ev.type == "stage_error":
-                self._fail_job(job, f"stage {d.get('stage')} on {worker_id}: {d.get('error')}")
+                if job.status != JobStatus.RUNNING:
+                    return
+                startup_oom = d.get("oom") and not d.get("steps_completed") and not job.losses
+                if startup_oom and self._replan(job, worker_id, d):
+                    return
+                hint = " (startup OOM; replanning exhausted or no placement fits)" if startup_oom else ""
+                self._fail_job(job, f"stage {d.get('stage')} on {worker_id}: {d.get('error')}{hint}")
 
 
 def create_app(coordinator: Coordinator) -> FastAPI:

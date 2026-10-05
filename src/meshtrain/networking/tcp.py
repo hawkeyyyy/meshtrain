@@ -104,11 +104,14 @@ def _hello_packet(hello: dict) -> TensorPacket:
 
 
 def connect(host: str, port: int, *, timeout: float = 30.0, hello: dict | None = None,
-            frame_timeout_s: float = 60.0, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> TCPTransport:
+            frame_timeout_s: float = 60.0, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+            stop_event=None) -> TCPTransport:
     """Connect (retrying until ``timeout``: the peer may still be starting) and send hello."""
     deadline = time.monotonic() + timeout
     last_exc: Exception | None = None
     while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            raise TransportTimeout("connect cancelled: job stopped")
         try:
             sock = socket.create_connection((host, port), timeout=min(5.0, timeout))
             break

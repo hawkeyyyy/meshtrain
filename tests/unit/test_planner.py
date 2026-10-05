@@ -22,7 +22,7 @@ def workers():
 @pytest.fixture(scope="module")
 def big_layers():
     # ~0.93B params: with Adam (16 bytes/param) too big for any single device below
-    return profile_model(TinyTransformerSpec(layers=32, hidden_size=1536, heads=16, vocab_size=8192, seq_len=256), 2)
+    return profile_model(TinyTransformerSpec(layers=32, hidden_size=1536, heads=16, vocab_size=8192, seq_len=64), 2)
 
 
 def test_profile_counts_parameters_exactly():
@@ -95,3 +95,39 @@ def test_manual_plan():
     layers = profile_model(MLPSpec(), 8)
     plan = plan_manual(layers, workers(), NetworkModel(), PlannerOptions(), [("a", 0, 3), ("rtx12", 3, 7)])
     assert plan.feasible and [s.worker_name for s in plan.stages] == ["rtx8", "rtx12"]
+
+
+def test_regression_real_hardware_capacity_outcomes():
+    """User-reported run: RTX 4070 Laptop (8 GB) + GTX 1050 Ti (3.94 GB), AdamW, batch 8 / microbatch 2.
+    396M parameters trained across both; 475M passed the V1 planner and then hit CUDA OOM on the 1050 Ti.
+    The V1.5 estimator must accept the first and reject the second."""
+    from meshtrain.experiments.capacity import model_cfg
+    from meshtrain.models import build_model_spec
+
+    ws = [WorkerProfile("hawkey", "hawkey", "cuda", int(8.0 * GB), 10e12),
+          WorkerProfile("server", "server", "cuda", int(3.94 * GB), 2e12)]
+    for (blocks, hidden), should_fit in (((20, 1280), True), ((24, 1280), False)):
+        layers = profile_model(build_model_spec(model_cfg(blocks, hidden)), 2)
+        for schedule in ("gpipe", "1f1b"):
+            plan = make_plan("auto", layers, ws, opts=PlannerOptions(optimizer="adamw", num_microbatches=4,
+                                                                       schedule=schedule))
+            assert plan.feasible == should_fit, (blocks, hidden, schedule)
+
+
+def test_memory_estimate_components():
+    layers = profile_model(TinyTransformerSpec(layers=4, hidden_size=256, heads=4, vocab_size=512, seq_len=64), 4)
+    adam = estimate_stage_memory(layers, total=8 * GB, optimizer="adamw", num_microbatches=8, is_last=False,
+                                 stage_index=0, num_stages=3, schedule="gpipe", backend="cuda")
+    sgd = estimate_stage_memory(layers, total=8 * GB, optimizer="sgd", num_microbatches=8, is_last=False,
+                                stage_index=0, num_stages=3, schedule="gpipe", backend="cuda")
+    f1b = estimate_stage_memory(layers, total=8 * GB, optimizer="adamw", num_microbatches=8, is_last=False,
+                                stage_index=0, num_stages=3, schedule="1f1b", backend="cuda")
+    P = adam.parameters
+    assert adam.optimizer_state == 2 * P and adam.optimizer_step_temporary == P and adam.gradients == P
+    assert sgd.optimizer_state == 0 and sgd.optimizer_step_temporary == 0
+    assert adam.in_flight == 8 and f1b.in_flight == 3
+    assert f1b.saved_activations * 8 == adam.saved_activations * 3
+    assert adam.usable == int(8 * GB * 0.85) - int(0.4 * GB)
+    mps = estimate_stage_memory(layers, total=8 * GB, optimizer="adamw", num_microbatches=8, is_last=True,
+                                backend="mps")
+    assert mps.usable == int(8 * GB * 0.80) and mps.in_flight == 1

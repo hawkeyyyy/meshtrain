@@ -24,7 +24,13 @@ from dataclasses import dataclass, field
 
 from meshtrain.planner.cost import NetworkModel, compute_time, pipeline_step_time
 from meshtrain.planner.graph import LayerProfile
-from meshtrain.planner.memory import MemoryEstimate, estimate_stage_memory
+from meshtrain.planner.memory import (
+    DEFAULT_FRAMEWORK_RESERVE,
+    DEFAULT_SAFETY_FACTOR,
+    MemoryEstimate,
+    estimate_stage_memory,
+    reserved_bytes,
+)
 
 
 @dataclass
@@ -135,11 +141,24 @@ class PlannerOptions:
     num_microbatches: int = 1
     allow_backends: tuple[str, ...] = ("cuda", "mps", "cpu")
     dtype: str = "float32"
-    headroom_fraction: float = 0.15
-    headroom_min_bytes: int = 512 * 1024**2
+    # V1 margin (reserved = max(fraction * total, min)); used only when set.
+    headroom_fraction: float | None = None
+    headroom_min_bytes: int | None = None
     activation_safety: float = 1.25
     num_stages: int | None = None
     max_orderings: int = 400
+    # V1.5 memory model (planner/memory.py)
+    schedule: str = "gpipe"                 # conservative default: gpipe holds the most activations
+    max_inflight: int | None = None
+    safety_factors: dict = field(default_factory=lambda: dict(DEFAULT_SAFETY_FACTOR))
+    framework_reserve: dict = field(default_factory=lambda: dict(DEFAULT_FRAMEWORK_RESERVE))
+    budget_overrides: dict = field(default_factory=dict)  # worker_id -> total bytes (startup replanning)
+
+    def memory_kwargs(self, backend: str) -> dict:
+        if self.headroom_fraction is not None or self.headroom_min_bytes is not None:
+            return {"headroom_fraction": self.headroom_fraction, "headroom_min_bytes": self.headroom_min_bytes}
+        return {"safety_factor": self.safety_factors.get(backend, 0.85),
+                "framework_reserve": self.framework_reserve.get(backend, 0)}
 
 
 class _Evaluator:
@@ -162,12 +181,22 @@ class _Evaluator:
             comm += self.network.transfer_time(out_bytes, w.worker_id, workers[idx + 1].worker_id)
         if idx > 0:
             comm += self.network.transfer_time(self.layers[start].input_bytes, w.worker_id, workers[idx - 1].worker_id)
-        mem = estimate_stage_memory(self.layers[start:end], total=w.memory_total, optimizer=self.opts.optimizer,
+        total = self.opts.budget_overrides.get(w.worker_id, w.memory_total)
+        mem = estimate_stage_memory(self.layers[start:end], total=total, optimizer=self.opts.optimizer,
                                     num_microbatches=self.opts.num_microbatches, is_last=last,
-                                    headroom_fraction=self.opts.headroom_fraction,
-                                    headroom_min_bytes=self.opts.headroom_min_bytes,
-                                    activation_safety=self.opts.activation_safety)
+                                    stage_index=idx, num_stages=len(workers), schedule=self.opts.schedule,
+                                    max_inflight=self.opts.max_inflight, backend=w.backend,
+                                    activation_safety=self.opts.activation_safety,
+                                    **self.opts.memory_kwargs(w.backend))
         return StagePlan(idx, w.worker_id, w.name, w.backend, start, end, mem, comp, comm, out_bytes)
+
+
+def _usable(w: WorkerProfile, opts: PlannerOptions) -> int:
+    total = opts.budget_overrides.get(w.worker_id, w.memory_total)
+    kw = opts.memory_kwargs(w.backend)
+    if "headroom_fraction" in kw:
+        return total - reserved_bytes(total, kw["headroom_fraction"] or 0.0, kw["headroom_min_bytes"] or 0)
+    return int(total * kw["safety_factor"]) - kw["framework_reserve"]
 
 
 def eligible_workers(workers: list[WorkerProfile], opts: PlannerOptions) -> tuple[list[WorkerProfile], dict[str, str]]:
@@ -177,8 +206,8 @@ def eligible_workers(workers: list[WorkerProfile], opts: PlannerOptions) -> tupl
             excluded[w.name] = f"backend {w.backend} not allowed"
         elif opts.dtype not in w.supported_dtypes:
             excluded[w.name] = f"no {opts.dtype} support"
-        elif w.memory_total <= opts.headroom_min_bytes:
-            excluded[w.name] = "memory below headroom"
+        elif _usable(w, opts) <= 0:
+            excluded[w.name] = "memory below safety margin"
         else:
             ok.append(w)
     return ok, excluded

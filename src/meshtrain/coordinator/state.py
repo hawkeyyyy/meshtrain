@@ -65,6 +65,10 @@ class JobRecord:
     last_metrics: dict[int, dict] = field(default_factory=dict)
     run_dir: str = ""
     summary: dict | None = None
+    attempt: int = 0                                      # placement attempt (startup replanning)
+    attempts: list[dict] = field(default_factory=list)
+    budget_overrides: dict[str, int] = field(default_factory=dict)
+    memory_reports: dict[str, dict] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -72,5 +76,6 @@ class JobRecord:
             "error": self.error, "plan": self.plan, "stage_workers": self.stage_workers,
             "losses": self.losses, "last_metrics": self.last_metrics,
             "stages_done": self.stages_done, "run_dir": self.run_dir, "summary": self.summary,
+            "attempt": self.attempt, "attempts": self.attempts, "memory_reports": self.memory_reports,
             "created_at": self.created_at, "finished_at": self.finished_at,
         }

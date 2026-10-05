@@ -30,7 +30,8 @@ def worker_profile(w: WorkerRecord) -> WorkerProfile:
                          unified_memory=bool(dev.get("unified_memory")), supported_dtypes=dtypes)
 
 
-def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: NetworkModel | None = None) -> Plan:
+def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: NetworkModel | None = None,
+             budget_overrides: dict[str, int] | None = None) -> Plan:
     spec = cfg.build_model_spec()
     mb_size = cfg.training.microbatch_size or cfg.training.batch_size
     layers = profile_model(spec, mb_size)
@@ -40,15 +41,21 @@ def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: Network
         if missing:
             raise ValueError(f"required workers not online: {sorted(missing)}")
     pc = cfg.placement
+    v1_margin = pc.memory_headroom_fraction is not None or pc.memory_headroom_min_gb is not None
     opts = PlannerOptions(
         optimizer=cfg.training.optimizer,
         num_microbatches=cfg.training.num_microbatches,
         allow_backends=tuple(cfg.workers.allow),
         dtype=cfg.model.dtype,
-        headroom_fraction=pc.memory_headroom_fraction,
-        headroom_min_bytes=int(pc.memory_headroom_min_gb * 1024**3),
+        headroom_fraction=(pc.memory_headroom_fraction or 0.0) if v1_margin else None,
+        headroom_min_bytes=int((pc.memory_headroom_min_gb or 0.0) * 1024**3) if v1_margin else None,
         activation_safety=pc.activation_overhead_factor,
         num_stages=pc.num_stages,
+        schedule=cfg.pipeline.schedule,
+        max_inflight=cfg.pipeline.max_inflight_microbatches,
+        safety_factors=cfg.memory.safety_factors(),
+        framework_reserve=cfg.memory.framework_reserve_bytes(),
+        budget_overrides=dict(budget_overrides or {}),
     )
     if pc.strategy == "manual":
         return plan_manual(layers, profiles, network or NetworkModel(), opts,

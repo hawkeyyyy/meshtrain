@@ -264,7 +264,7 @@ def _load_raw(path: str) -> dict:
     from meshtrain.config import load_config
 
     cfg = load_config(path)  # validates
-    return cfg.model_dump(mode="json")
+    return cfg.model_dump(mode="json", by_alias=True)
 
 
 def cmd_plan(args) -> int:

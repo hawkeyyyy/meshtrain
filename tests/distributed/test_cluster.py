@@ -38,8 +38,8 @@ def cluster(tmp_path):
             time.sleep(0.1)
     procs = []
 
-    def start_worker(name):
-        env = {**os.environ, "MESHTRAIN_TOKEN": TOKEN, "OMP_NUM_THREADS": "1"}
+    def start_worker(name, extra_env=None):
+        env = {**os.environ, "MESHTRAIN_TOKEN": TOKEN, "OMP_NUM_THREADS": "1", **(extra_env or {})}
         p = subprocess.Popen([sys.executable, "-m", "meshtrain.cli", "worker", "join", f"127.0.0.1:{port}",
                               "--device", "cpu", "--name", name, "--data-port", "0", "--advertise-host",
                               "127.0.0.1", "--quick-benchmark", "--runs-dir", str(tmp_path / "worker-runs")],
@@ -138,3 +138,36 @@ def test_worker_death_fails_job_cleanly(cluster):
         time.sleep(0.2)
         survivor = [w for w in client.status()["workers"] if w["worker_id"] != victim][0]
     assert survivor["status"] == "ONLINE"
+
+
+def test_startup_memory_failure_triggers_replan(cluster):
+    """The planner believes both CPU workers have plenty of RAM; 'small' really has 0.12 GB.
+    Startup validation must catch it before training, and the coordinator must replan
+    with the measured capacity instead of failing or crashing mid-step."""
+    client, coord, start_worker, wait_online = cluster
+    start_worker("big")
+    start_worker("small", {"MESHTRAIN_EMULATE_DEVICE_MEMORY_GB": "0.12"})
+    wait_online(2)
+    cfg = {
+        "job": {"name": "replan"},
+        "model": {"type": "mlp", "sizes": [256, 2048, 2048, 2048, 2048, 2048, 10]},
+        "training": {"batch_size": 16, "microbatch_size": 4, "learning_rate": 0.001, "optimizer": "adamw",
+                     "steps": 3, "log_every": 1},
+        "placement": {"strategy": "auto", "num_stages": 2},
+        "workers": {"allow": ["cpu"]},
+        "network": {"timeout_s": 20, "connect_timeout_s": 20},
+        "memory": {"probe_allocation": False},
+    }
+    job = client.start_job(cfg)
+    j = _wait_job(client, job["job_id"], timeout=180)
+    assert j["status"] == "COMPLETED", j["error"]
+    assert j["attempt"] >= 1, "expected at least one startup replan"
+    first = j["attempts"][0]
+    assert first["failure"]["worker"] == "small"
+    assert "startup" in first["failure"]["error"]
+    small_layers = [p["layers"] for p in j["attempts"][-1]["placement"] if p["worker"] == "small"]
+    first_small = [p["layers"] for p in first["placement"] if p["worker"] == "small"]
+    size = lambda r: r[0][1] - r[0][0]  # noqa: E731
+    assert small_layers, "the replanned placement still uses the small worker, with less of the model"
+    assert size(small_layers) < size(first_small)
+    assert j["memory_reports"], "startup memory validation reports are recorded"

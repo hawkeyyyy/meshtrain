@@ -19,6 +19,7 @@ from meshtrain.profiler.hardware import detect_hardware
 from meshtrain.profiler.network import measure_link
 from meshtrain.telemetry import EventLogger
 from meshtrain.worker.device import DeviceAdapter, select_device
+from meshtrain.runtime.memory_check import is_oom
 from meshtrain.worker.executor import DataPlaneServer, run_assignment
 from meshtrain.worker.heartbeat import Heartbeat
 
@@ -51,7 +52,8 @@ class WorkerAgent:
         self.advertise_host = advertise_host or guess_advertise_host(self.client.base)
         self.worker_id: str | None = None
         self._stop = threading.Event()
-        self._jobs: dict[str, threading.Event] = {}
+        self._jobs: dict[tuple[str, int], threading.Event] = {}     # (job, attempt) -> stop
+        self._stage_threads: dict[tuple[str, int], threading.Thread] = {}
         self.heartbeat: Heartbeat | None = None
 
     # -- registration -----------------------------------------------------
@@ -138,10 +140,10 @@ class WorkerAgent:
             elif kind == "START_STAGE":
                 self._run_stage(cmd)
             elif kind == "STOP_JOB":
-                ev = self._jobs.get(cmd["job_id"])
-                if ev:
-                    self.log.log("STOP_REQUESTED", job_id=cmd["job_id"], reason=cmd.get("reason"))
-                    ev.set()
+                for (job, attempt), ev in list(self._jobs.items()):
+                    if job == cmd["job_id"] and cmd.get("attempt") in (None, attempt):
+                        self.log.log("STOP_REQUESTED", job_id=job, attempt=attempt, reason=cmd.get("reason"))
+                        ev.set()
             else:
                 raise ValueError(f"unknown command {kind!r}")
         except Exception as exc:
@@ -150,24 +152,46 @@ class WorkerAgent:
                 self._event("command_error", {"request_id": rid, "error": f"{type(exc).__name__}: {exc}"})
 
     def _run_stage(self, cmd: dict) -> None:
-        job_id, idx = cmd["job_id"], cmd["stage_index"]
-        stop = self._jobs.setdefault(job_id, threading.Event())
+        job_id, idx, attempt = cmd["job_id"], cmd["stage_index"], int(cmd.get("attempt", 0))
+        key = (job_id, attempt)
+        # A replanned job: make sure the previous attempt on this worker has fully
+        # released its device memory before materialising the new stage.
+        for (job, old), ev in list(self._jobs.items()):
+            if job == job_id and old < attempt:
+                ev.set()
+                th = self._stage_threads.get((job, old))
+                if th is not None and th is not threading.current_thread():
+                    th.join(timeout=60)
+        stop = self._jobs.setdefault(key, threading.Event())
+        self._stage_threads[key] = threading.current_thread()
+        steps = {"n": 0}
+
+        def on_metrics(rec: dict) -> None:
+            if rec.get("event") == "STEP_COMPLETE":
+                steps["n"] += 1
+            self._event("stage_metrics", {"job_id": job_id, "attempt": attempt, "record": rec})
+
         t0 = time.time()
         try:
             result = run_assignment(
                 cmd, device=self.device, dataplane=self.dataplane, worker_name=self.worker_id, token=self.token,
-                metrics_callback=lambda rec: self._event("stage_metrics", {"job_id": job_id, "record": rec}),
-                stop_event=stop, runs_dir=self.runs_dir, verbose=self.verbose)
-            self._event("stage_done", {"job_id": job_id, "stage": idx,
+                metrics_callback=on_metrics, stop_event=stop, runs_dir=self.runs_dir, verbose=self.verbose)
+            self._event("stage_done", {"job_id": job_id, "attempt": attempt, "stage": idx,
                                        "summary": {"steps": len(result.step_metrics), "wall_s": time.time() - t0,
                                                    "final_loss": result.losses[-1] if result.losses else None}})
         except Exception as exc:
             if stop.is_set():
-                self.log.log("STAGE_STOPPED", job_id=job_id)
+                self.log.log("STAGE_STOPPED", job_id=job_id, attempt=attempt)
                 return
-            self.log.log("STAGE_FAILED", job_id=job_id, error=f"{type(exc).__name__}: {exc}")
+            self.log.log("STAGE_FAILED", job_id=job_id, error=f"{type(exc).__name__}: {exc}"[:500])
             if self.verbose:
                 traceback.print_exc()
-            self._event("stage_error", {"job_id": job_id, "stage": idx, "error": f"{type(exc).__name__}: {exc}"})
+            report = getattr(exc, "report", None)
+            if report is None and is_oom(exc):
+                report = {"available": self.device.available_memory()}
+            self._event("stage_error", {"job_id": job_id, "attempt": attempt, "stage": idx,
+                                        "error": f"{type(exc).__name__}: {exc}"[:1000], "oom": is_oom(exc),
+                                        "steps_completed": steps["n"], "memory_report": report})
         finally:
-            self._jobs.pop(job_id, None)
+            self._jobs.pop(key, None)
+            self._stage_threads.pop(key, None)

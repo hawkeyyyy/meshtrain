@@ -23,6 +23,13 @@ from meshtrain.config import parse_config
 from meshtrain.networking.tcp import TCPListener, TCPTransport, connect
 from meshtrain.networking.transport import TransportTimeout
 from meshtrain.profiler.network import serve_probe
+from meshtrain.runtime.memory_check import (
+    StageMemoryError,
+    format_validation,
+    is_oom,
+    release_device_memory,
+    validate_stage,
+)
 from meshtrain.runtime.pipeline import StageResult, run_stage
 from meshtrain.runtime.stage import Stage
 from meshtrain.telemetry import EventLogger
@@ -74,7 +81,7 @@ class DataPlaneServer:
         finally:
             link.close()
 
-    def claim(self, job_id: str, from_stage: int, timeout: float) -> TCPTransport:
+    def claim(self, job_id: str, from_stage: int, timeout: float, stop_event=None) -> TCPTransport:
         deadline = time.monotonic() + timeout
         with self._cond:
             while (job_id, from_stage) not in self._pending:
@@ -82,7 +89,9 @@ class DataPlaneServer:
                 if left <= 0:
                     raise TransportTimeout(f"stage {from_stage} of job {job_id} never connected "
                                            f"(waited {timeout:.0f}s)")
-                self._cond.wait(left)
+                if stop_event is not None and stop_event.is_set():
+                    raise TransportTimeout("claim cancelled: job stopped")
+                self._cond.wait(min(left, 0.5))
             return self._pending.pop((job_id, from_stage))
 
     def close(self) -> None:
@@ -102,40 +111,93 @@ def run_assignment(
     runs_dir: str = "runs",
     verbose: bool = True,
 ) -> StageResult:
-    """Execute one START_STAGE assignment (see coordinator.server.start_job)."""
+    """Execute one START_STAGE assignment (see coordinator.server.start_job).
+
+    Startup: materialise the stage, validate its memory against the planner's
+    estimate (``memory_check``), then connect links and train. Any memory
+    failure before training is raised as ``StageMemoryError`` with the
+    measurements, after releasing the device memory, so the coordinator can
+    replan.
+    """
     cfg = parse_config(assignment["config"])
     job_id = assignment["job_id"]
+    data_job = assignment.get("data_job_id", job_id)  # unique per placement attempt
     idx, n = int(assignment["stage_index"]), int(assignment["num_stages"])
     start, end = assignment["layers"]
     run_dir = Path(runs_dir) / job_id
     logger = EventLogger(worker_name, job_id, jsonl_path=run_dir / f"events-{worker_name}.jsonl", verbose=verbose)
     spec = cfg.build_model_spec()
     up = down = None
+    stage = None
+    estimate = assignment.get("memory_estimate")
+    emit = metrics_callback or (lambda rec: None)
     try:
-        logger.log("STAGE_ASSIGNED", stage=idx, layers=f"{start}-{end - 1}", device=str(device.device))
-        stage = Stage(spec.build_stage(start, end), stage_index=idx, num_stages=n, device=device,
-                      optimizer=cfg.training.optimizer, lr=cfg.training.learning_rate, loss_fn=spec.loss_fn,
-                      name=worker_name)
+        logger.log("STAGE_ASSIGNED", stage=idx, layers=f"{start}-{end - 1}", device=str(device.device),
+                   attempt=assignment.get("attempt", 0))
+        try:
+            stage = Stage(spec.build_stage(start, end), stage_index=idx, num_stages=n, device=device,
+                          optimizer=cfg.training.optimizer, lr=cfg.training.learning_rate, loss_fn=spec.loss_fn,
+                          name=worker_name)
+            report = None
+            if cfg.memory.validate_runtime_usage:
+                sf = cfg.memory.safety_factors().get(device.backend, cfg.memory.safety_factor)
+                report = validate_stage(stage, device, estimate, probe=cfg.memory.probe_allocation, safety_factor=sf)
+                logger.log("MEMORY_VALIDATED", stage=idx, summary=format_validation(report))
+                emit({"event": "MEMORY_VALIDATION", "job": job_id, "worker": worker_name, "stage": idx,
+                      "phase": "startup", **report})
+        except Exception as exc:
+            if not is_oom(exc):
+                raise
+            rep = getattr(exc, "report", {"available": device.available_memory()})
+            stage = None
+            release_device_memory(device)
+            logger.log("STAGE_MEMORY_FAILED", stage=idx, error=str(exc)[:300])
+            raise StageMemoryError(f"startup: {exc}", rep) from exc
+
         timeout = cfg.network.timeout_s
         max_bytes = int(cfg.network.max_tensor_mb * 1024**2)
         if assignment.get("downstream"):
             d = assignment["downstream"]
-            hello = {"job_id": job_id, "stage": idx}
+            hello = {"job_id": data_job, "stage": idx}
             if token is not None:
                 hello["token"] = token
             down = connect(d["host"], int(d["port"]), timeout=cfg.network.connect_timeout_s, hello=hello,
-                           frame_timeout_s=timeout, max_payload_bytes=max_bytes)
+                           frame_timeout_s=timeout, max_payload_bytes=max_bytes, stop_event=stop_event)
             logger.log("LINK_CONNECTED", direction="downstream", peer=f"{d['host']}:{d['port']}")
         if idx > 0:
-            up = dataplane.claim(job_id, idx - 1, timeout=cfg.network.connect_timeout_s)
+            up = dataplane.claim(data_job, idx - 1, timeout=cfg.network.connect_timeout_s, stop_event=stop_event)
             up.frame_timeout_s = timeout
             up.max_payload_bytes = max_bytes
             logger.log("LINK_CONNECTED", direction="upstream", peer=up.peer)
-        settings = cfg.pipeline_settings(job_id, log_microbatch_events=bool(assignment.get("trace", False)))
-        return run_stage(stage, spec, settings, upstream=up, downstream=down, worker=worker_name, logger=logger,
-                         metrics_callback=metrics_callback, stop_event=stop_event)
+        settings = cfg.pipeline_settings(data_job, log_microbatch_events=bool(assignment.get("trace", False)),
+                                         trace=bool(assignment.get("timeline", True)))
+
+        first = {"done": False}
+
+        def on_step(rec: dict) -> None:
+            if not first["done"] and estimate:
+                first["done"] = True
+                peak = int(rec["memory"].get("device_peak", 0))
+                rec["memory_validation"] = {
+                    "estimated_required": int(estimate["required"]), "actual_peak_step0": peak,
+                    "peak_estimate_error": (peak - estimate["required"]) / estimate["required"]
+                    if estimate["required"] else 0.0,
+                    "note": "CPU peak is process RSS" if device.backend == "cpu" else "torch allocator peak"}
+            rec["job"] = job_id
+            emit(rec)
+
+        result = run_stage(stage, spec, settings, upstream=up, downstream=down, worker=worker_name, logger=logger,
+                           metrics_callback=on_step, stop_event=stop_event)
+        if result.timeline is not None:
+            import json as _json
+
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / f"timeline-stage{idx}-{worker_name}.json").write_text(_json.dumps(result.timeline))
+        return result
     finally:
         for link in (up, down):
             if link is not None:
                 link.close()
+        stage = None
+        release_device_memory(device)
         logger.close()

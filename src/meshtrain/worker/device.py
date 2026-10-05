@@ -8,6 +8,7 @@ adapter here, not touching the runtime.
 from __future__ import annotations
 
 import abc
+import os
 import platform
 
 import psutil
@@ -108,6 +109,13 @@ class DeviceAdapter(abc.ABC):
     def reset_peak_memory(self) -> None:
         pass
 
+    def available_memory(self, in_use: int = 0) -> int:
+        """Bytes this process could still allocate on the device. ``in_use`` is
+        what the caller already holds (used only where the backend cannot
+        tell, e.g. emulated CPU budgets)."""
+        st = self.memory_stats()
+        return max(0, int(st.get("total", 0)) - int(st.get("allocated", 0)))
+
     def supports_dtype(self, dtype: torch.dtype) -> bool:
         return True
 
@@ -163,6 +171,15 @@ class CPUDeviceAdapter(DeviceAdapter):
         if operation in ("pinned_memory", "nccl"):
             return False
         return super().supports(operation)
+
+    def available_memory(self, in_use: int = 0) -> int:
+        # Fault injection for tests/experiments: pretend this worker's device has
+        # only N GB (the planner still sees the real RAM, so its estimate is
+        # "wrong" and runtime validation must catch it).
+        emulated = os.environ.get("MESHTRAIN_EMULATE_DEVICE_MEMORY_GB")
+        if emulated:
+            return max(0, int(float(emulated) * 1024**3) - in_use)
+        return int(psutil.virtual_memory().available)
 
 
 class CUDADeviceAdapter(DeviceAdapter):
@@ -256,6 +273,13 @@ class CUDADeviceAdapter(DeviceAdapter):
     def reset_peak_memory(self) -> None:
         torch.cuda.reset_peak_memory_stats(self.index)
 
+    def available_memory(self, in_use: int = 0) -> int:
+        # Free device memory as the driver sees it, plus memory torch has cached
+        # but not handed out (reusable without a new driver allocation).
+        free, _ = torch.cuda.mem_get_info(self.index)
+        cached = torch.cuda.memory_reserved(self.index) - torch.cuda.memory_allocated(self.index)
+        return int(free + max(0, cached))
+
     def supports_dtype(self, dtype: torch.dtype) -> bool:
         if dtype == torch.bfloat16:
             return torch.cuda.is_bf16_supported()
@@ -306,6 +330,12 @@ class MPSDeviceAdapter(DeviceAdapter):
     def supports_dtype(self, dtype: torch.dtype) -> bool:
         # MPS has no float64 kernels.
         return dtype != torch.float64
+
+    def available_memory(self, in_use: int = 0) -> int:
+        # Unified memory: the budget is the recommended working set minus what
+        # the Metal driver already holds for this process.
+        st = self.memory_stats()
+        return max(0, int(st["total"]) - int(st["reserved"]))
 
 
 ADAPTERS: dict[str, type[DeviceAdapter]] = {
