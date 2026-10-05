@@ -27,3 +27,26 @@ Device: CPU only (each stage in its own OS process; tensors cross process bounda
 - **MLP 2 stages, 4 microbatches** — per-stage max abs error: stage0: 0.00e+00, stage1: 0.00e+00
 - **Transformer (4 blocks, d=64) 3 stages, 2 microbatches** — per-stage max abs error: stage0: 9.31e-10, stage1: 9.31e-10, stage2: 3.73e-09
 <!-- END:experiment1-pipe -->
+
+### TCP transport (separate processes, loopback TCP — Milestone 2)
+
+The stages talk over real TCP sockets. In this run both ends were on one host (127.0.0.1); no
+multi-machine run has been recorded yet.
+
+<!-- BEGIN:experiment1-tcp -->
+_Generated 2026-10-05 12:36 on vm (Linux x86_64, torch 2.14.1+cu130, CUDA available: False, MPS available: False)._
+
+Device: CPU only (each stage in its own OS process; tensors cross process boundaries as serialized TensorPackets). Batch split identically in the single-process reference.
+
+| case | transport | stages | microbatches | params | max abs err | max relative err | loss abs diff | result |
+|---|---|---|---|---|---|---|---|---|
+| MLP 2 stages | tcp | 2 | 1 | 8 | 0.00e+00 | 0.00e+00 | 0.00e+00 | PASS |
+| MLP 3 stages | tcp | 3 | 1 | 8 | 0.00e+00 | 0.00e+00 | 0.00e+00 | PASS |
+| MLP 2 stages, 4 microbatches | tcp | 2 | 4 | 8 | 0.00e+00 | 0.00e+00 | 0.00e+00 | PASS |
+| Transformer (4 blocks, d=64) 3 stages, 2 microbatches | tcp | 3 | 2 | 54 | 3.73e-09 | 1.78e-07 | 0.00e+00 | PASS |
+
+- **MLP 2 stages** — per-stage max abs error: stage0: 0.00e+00, stage1: 0.00e+00
+- **MLP 3 stages** — per-stage max abs error: stage0: 0.00e+00, stage1: 0.00e+00, stage2: 0.00e+00
+- **MLP 2 stages, 4 microbatches** — per-stage max abs error: stage0: 0.00e+00, stage1: 0.00e+00
+- **Transformer (4 blocks, d=64) 3 stages, 2 microbatches** — per-stage max abs error: stage0: 9.31e-10, stage1: 9.31e-10, stage2: 3.73e-09
+<!-- END:experiment1-tcp -->

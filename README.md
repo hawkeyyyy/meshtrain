@@ -9,6 +9,7 @@ Status: **V1 in progress.** See `docs/architecture.md` and `docs/v1-results.md`.
 | Milestone | Status |
 |---|---|
 | 1. Local CPU prototype (separate processes, gradient equivalence) | done, verified on CPU |
+| 2. TCP transport | done; verified over loopback TCP on one host (no physical multi-machine run yet) |
 
 ## Development
 
