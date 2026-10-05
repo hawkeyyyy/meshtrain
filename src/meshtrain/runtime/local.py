@@ -72,7 +72,7 @@ def _stage_process(index, stages, model_cfg, seed, settings, optimizer, lr, tran
             down = EmulatedLink(down, bw, lat) if down is not None else None
         stage = Stage(spec.build_stage(*st.layers), stage_index=index, num_stages=len(stages),
                       device=select_device(st.device), optimizer=optimizer, lr=lr, loss_fn=spec.loss_fn,
-                      name=worker)
+                      name=worker, layer_offset=st.layers[0])
         logger = EventLogger(worker, settings.job_id)
         res = run_stage(stage, spec, settings, upstream=up, downstream=down, worker=worker,
                         logger=logger, capture_params=capture_params)

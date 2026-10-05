@@ -9,30 +9,10 @@ redesigned. Do not add behaviour here without an explicit request.
 from __future__ import annotations
 
 import abc
-import enum
 
 
-class MemoryTier(enum.Enum):
-    LOCAL_ACCELERATOR = "local_accelerator"   # the only tier used by V1
-    LOCAL_RAM = "local_ram"
-    REMOTE_ACCELERATOR = "remote_accelerator"
-    REMOTE_RAM = "remote_ram"
-    LOCAL_NVME = "local_nvme"
-    REMOTE_NVME = "remote_nvme"
-    RECOMPUTE = "recompute"                   # drop and recompute from an earlier checkpoint
-
-
-class TensorStore(abc.ABC):
-    """Where a named tensor (weight, optimizer state, saved activation) lives."""
-
-    @abc.abstractmethod
-    def put(self, key: str, tensor, tier: MemoryTier) -> None: ...
-
-    @abc.abstractmethod
-    def get(self, key: str, device): ...
-
-    @abc.abstractmethod
-    def tier_of(self, key: str) -> MemoryTier: ...
+# MemoryTier, TensorStore and the V1.5 LocalTensorStore live in runtime/tensor_store.py.
+from meshtrain.runtime.tensor_store import LocalTensorStore, MemoryTier, TensorRole, TensorStore  # noqa: E402,F401
 
 
 class PlacementPolicy(abc.ABC):

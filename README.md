@@ -7,7 +7,8 @@ over the network. No NCCL or other shared collective library is involved, so a C
 MacBook can sit in the same pipeline.
 
 Research direction: *topology-aware distributed tensor memory and heterogeneous distributed model
-execution across consumer accelerators.* V1 is the minimal, correct foundation. MeshTrain does
+execution across consumer accelerators.* V1 is the minimal, correct foundation; V1.5 makes it efficient
+(1F1B schedule, async transport, overlap, memory accounting, MPS, topology-aware planning). MeshTrain does
 **not** create shared VRAM: each kernel uses only its own device's memory. See
 [docs/research-notes.md](docs/research-notes.md).
 
@@ -26,6 +27,29 @@ execution across consumer accelerators.* V1 is the minimal, correct foundation. 
 | 9. Capacity experiment | **Emulated on CPU only** (scaled-down budgets): capacity gain 2.59x. The hardware mode exists but has **not** been run on physical GPUs |
 
 All numbers and their environments are in [docs/v1-results.md](docs/v1-results.md).
+
+## Status (V1.5)
+
+Placement is still static: each stage stays on one worker for the whole job. See
+[docs/v1.5-architecture.md](docs/v1.5-architecture.md) and [docs/v1-vs-v1.5.md](docs/v1-vs-v1.5.md).
+
+| Milestone | Status |
+|---|---|
+| 1. V1 audit and baseline | Done: [docs/v1.5-baseline.md](docs/v1.5-baseline.md) |
+| 2. Event/state-machine pipeline (GPipe preserved) | **Verified on CPU** (gradient equivalence) |
+| 3. Async transport with bounded queues | **Verified on CPU/loopback**, including back-pressure and a 4-stage × 32-microbatch stress test |
+| 4. Buffer reuse, pinned CUDA staging | Buffer reuse **verified on CPU**; pinned/stream path implemented, CUDA tests **not run (no GPU)** |
+| 5. 1F1B on CPU | **Verified**: gradients equal GPipe and single-process; stage-0 activations 37.9 → 14.2 MB |
+| 6. 1F1B on CUDA | Implemented; CUDA-marked tests **not run (no GPU)** |
+| 7. Compute/communication overlap | **Measured on CPU** with an emulated 100 Mbit/s link: 864 → 501 ms/step |
+| 8. Memory estimation + startup OOM replanning | **Verified on CPU** with emulated device memory; estimator matches the real RTX 4070 + 1050 Ti outcomes (396M fits, 475M rejected) |
+| 9. MPS adapter, CUDA→CUDA→MPS | Implemented with capability probes; MPS tests **not run (no Mac)** |
+| 10. Topology-aware planner | **Verified** (unit tests) |
+| 11. Timeline tracing, benchmark reports | **Verified on CPU**: Chrome traces, overlap/idle breakdown, prediction accuracy |
+| 12. TensorStore / MemoryTier interfaces | Interfaces + stable tensor IDs only; no eviction or paging (that is V2) |
+
+Defaults changed in V1.5: `pipeline.schedule: 1f1b`, `transport.async: true`, `placement.strategy:
+topology_aware`. Set `schedule: gpipe` and `async: false` to get V1 behaviour.
 
 ## Install
 
@@ -120,7 +144,14 @@ uv run meshtrain experiment placement                     # Exp 4 on emulated he
 uv run meshtrain experiment placement --cluster cluster.json   # Exp 4 predictions for a real cluster
 uv run meshtrain experiment capacity                      # Exp 5, emulated budgets
 uv run meshtrain experiment capacity --mode hardware      # Exp 5 on a real cluster (via coordinator)
+uv run meshtrain experiment device-correctness --devices cuda,cuda   # per-device gradient check vs CPU
+uv run meshtrain benchmark pipeline                       # V1 vs V1.5 modes, local, emulated link
+uv run meshtrain benchmark pipeline --cluster --config configs/two_cuda.yaml   # same on a real cluster
+uv run meshtrain inspect placement configs/tiny_transformer_cpu.yaml           # planned stages, memory, comm
 ```
+
+Each cluster run writes `runs/<job>/timeline.json` (open in https://ui.perfetto.dev),
+`timeline_report.txt` and `prediction_accuracy.json`. See [docs/performance.md](docs/performance.md).
 
 Experiments 2 and 3 are `meshtrain train configs/two_cuda.yaml` / `configs/cuda_cuda_mps.yaml`
 followed by `meshtrain results record`. Recording replays the first steps on CPU and reports the
@@ -132,10 +163,16 @@ loss-curve deviation as a correctness check.
 job:       {name: tiny-transformer-test, seed: 0}
 model:     {type: tiny_transformer, layers: 12, hidden_size: 512, heads: 8, vocab_size: 1024, seq_len: 128}
 training:  {batch_size: 16, microbatch_size: 4, learning_rate: 0.0003, optimizer: adamw, steps: 500}
-placement: {strategy: auto, num_stages: 3}     # auto | equal | compute | manual (+ stages: [...])
+placement: {strategy: topology_aware, num_stages: 3}  # topology_aware (=auto) | equal | compute | manual
 workers:   {allow: [cuda, mps, cpu]}
 network:   {tensor_transport: tcp, timeout_s: 120}
+pipeline:  {schedule: 1f1b, max_inflight_microbatches: null}   # 1f1b | gpipe
+transport: {async: true, pinned_memory: true, buffer_pool: true}
+memory:    {safety_factor: 0.85, backend_safety_factor: {mps: 0.80}, max_replans: 2}
 ```
+
+Memory settings are explained in [docs/memory-accounting.md](docs/memory-accounting.md), schedules in
+[docs/pipeline-scheduling.md](docs/pipeline-scheduling.md), MPS in [docs/mps.md](docs/mps.md).
 
 Configs are validated strictly: unknown keys, bad sizes and non-contiguous manual stages are
 rejected. See `src/meshtrain/config.py`.
@@ -165,9 +202,13 @@ not expose MeshTrain to the Internet or to untrusted peers.**
 src/meshtrain/
   coordinator/  server.py registry.py scheduler.py state.py      control plane (FastAPI)
   worker/       worker.py device.py executor.py heartbeat.py      worker agent, device adapters
+                capabilities.py                                    probed op/dtype support
   runtime/      stage.py pipeline.py distributed_autograd.py      execution (transport-independent)
+                scheduler.py outbox.py buffers.py timeline.py      V1.5: schedules, async sends, buffers, traces
+                memory_check.py trace_report.py tensor_store.py
                 tensor_packet.py serialization.py local.py
   networking/   protocol.py transport.py tcp.py control.py         data/control plane I/O
+                emulation.py                                       bandwidth/latency emulation (experiments)
   profiler/     hardware.py benchmark.py network.py
   planner/      graph.py partition.py cost.py memory.py
   models/       mlp_test.py tiny_transformer.py

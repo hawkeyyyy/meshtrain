@@ -377,7 +377,9 @@ def run_stage(
                 grad_norms = {n: float(p.grad.detach().float().norm()) for n, p in stage.module.named_parameters()
                               if p.grad is not None}
                 before = stage.named_parameters_cpu() if local_step == 0 else None
+            stage.refresh_tensor_store()
             mem = stage.memory_report()  # gradients present, before zero_grad
+            mem["tensor_store"] = stage.tensor_store.bytes_by_role()
             mem["saved_activations_peak"] = peak_saved_bytes
             mem["saved_microbatches_peak"] = peak_saved_mbs
             with tl.span("OPTIMIZER_STEP", step):

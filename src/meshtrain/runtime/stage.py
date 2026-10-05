@@ -21,6 +21,7 @@ from meshtrain.runtime.distributed_autograd import (
     boundary_input_grad,
     make_boundary_input,
 )
+from meshtrain.runtime.tensor_store import LocalTensorStore, TensorRole, activation_id, parameter_id
 from meshtrain.worker.device import CPUDeviceAdapter, DeviceAdapter
 
 
@@ -47,6 +48,7 @@ class Stage:
         lr: float = 0.01,
         loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         name: str | None = None,
+        layer_offset: int = 0,
     ):
         self.device = device or CPUDeviceAdapter()
         self.module = self.device.move_module(module)
@@ -60,6 +62,28 @@ class Stage:
         self._param_ids = {id(p) for p in self.module.parameters()}
         if self.is_last and loss_fn is None:
             raise ValueError("the last stage needs a loss function")
+        # Stable identities for everything this stage owns (V2 preparation; no movement).
+        self.layer_offset = layer_offset
+        self.tensor_store = LocalTensorStore(self.name, self.device.backend)
+        for n, p in self.module.named_parameters():
+            self.tensor_store.put(self.global_name(n), p, TensorRole.PARAMETER)
+
+    def global_name(self, local_name: str) -> str:
+        """'3.qkv.weight' inside this stage -> 'model.layers.<offset+3>.qkv.weight'."""
+        idx, rest = local_name.split(".", 1)
+        return parameter_id(int(idx) + self.layer_offset, rest)
+
+    def refresh_tensor_store(self) -> None:
+        """Record gradients and optimizer state (they appear lazily during training)."""
+        store = self.tensor_store
+        for n, p in self.module.named_parameters():
+            gid = self.global_name(n)
+            if p.grad is not None:
+                store.put(gid + ".grad", p.grad, TensorRole.GRADIENT)
+            if self.optimizer is not None:
+                for key, v in self.optimizer.state.get(p, {}).items():
+                    if torch.is_tensor(v) and v.dim() > 0:
+                        store.put(f"{gid}.optim.{key}", v, TensorRole.OPTIMIZER_STATE)
 
     @property
     def is_first(self) -> bool:
@@ -95,6 +119,8 @@ class Stage:
         context.input, context.output = x, out
         context.timings["forward"] = time.perf_counter() - t0
         self.contexts.put(context)
+        self.tensor_store.put(activation_id(context.step_id, context.microbatch_id, self.stage_index), x,
+                              TensorRole.ACTIVATION)
         return out
 
     def forward_loss(self, inp: torch.Tensor, target: torch.Tensor, context: MicrobatchContext,
@@ -110,6 +136,7 @@ class Stage:
         t0 = time.perf_counter()
         loss = self.loss_fn(out, self.device.move_tensor(target))
         self.contexts.pop(context.step_id, context.microbatch_id)
+        self.tensor_store.discard(activation_id(context.step_id, context.microbatch_id, self.stage_index))
         (loss * loss_scale).backward()
         self.device.sync_compute()
         context.timings["backward"] = time.perf_counter() - t0
@@ -126,6 +153,7 @@ class Stage:
         if not self.is_last:
             raise BoundaryError("loss_backward is only valid on the last stage")
         ctx = self.contexts.pop(*context_key)
+        self.tensor_store.discard(activation_id(*context_key, self.stage_index))
         t0 = time.perf_counter()
         loss = self.loss_fn(ctx.output, self.device.move_tensor(target))
         (loss * loss_scale).backward()
@@ -138,6 +166,7 @@ class Stage:
     def backward(self, grad_output: torch.Tensor, context_key: tuple[int, int]) -> tuple[torch.Tensor | None, MicrobatchContext]:
         """Backprop a received gradient through the saved graph of one microbatch."""
         ctx = self.contexts.pop(*context_key)
+        self.tensor_store.discard(activation_id(*context_key, self.stage_index))
         t0 = time.perf_counter()
         boundary_backward(ctx.output, self.device.move_tensor(grad_output))
         self.device.sync_compute()

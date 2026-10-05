@@ -1,5 +1,8 @@
 # MeshTrain V1 Architecture
 
+> V1.5 builds on this design (1F1B, async transport, overlap, memory accounting, MPS, topology-aware
+> planning). See [v1.5-architecture.md](v1.5-architecture.md) for what changed.
+
 MeshTrain V1 is a **synchronous pipeline-parallel training runtime** for
 heterogeneous machines. A sequential model is cut into contiguous *stages*;
 each stage runs on one worker (CUDA, MPS or CPU). Activations travel forward

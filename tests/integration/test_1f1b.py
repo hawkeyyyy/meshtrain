@@ -123,3 +123,13 @@ def test_pipeline_benchmark_reports_all_modes(tmp_path):
     assert v15["peak_saved_mb_stage0"] <= v1["peak_saved_mb_stage0"]
     import os
     assert os.path.exists(os.path.join(r["run_dir"], "timeline-1f1b-async.json"))
+
+
+def test_tensor_store_reported_and_no_leaked_activations():
+    stages = SPLITS[2]
+    s = PipelineSettings("ts", steps=3, batch_size=16, num_microbatches=4, schedule="1f1b", async_transport=True)
+    res = run_local_pipeline(MLP, stages, s)
+    for r in res:
+        ts = r.step_metrics[-1]["memory"]["tensor_store"]
+        assert ts["parameter"] > 0 and ts["gradient"] == ts["parameter"]
+        assert ts["activation"] == 0  # every microbatch's activation entry released after its backward

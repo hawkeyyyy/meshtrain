@@ -137,7 +137,7 @@ def run_assignment(
         try:
             stage = Stage(spec.build_stage(start, end), stage_index=idx, num_stages=n, device=device,
                           optimizer=cfg.training.optimizer, lr=cfg.training.learning_rate, loss_fn=spec.loss_fn,
-                          name=worker_name)
+                          name=worker_name, layer_offset=start)
             report = None
             if cfg.memory.validate_runtime_usage:
                 sf = cfg.memory.safety_factors().get(device.backend, cfg.memory.safety_factor)
