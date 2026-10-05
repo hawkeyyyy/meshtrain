@@ -221,6 +221,36 @@ def cmd_cluster_status(args) -> int:
     return 0
 
 
+def cmd_benchmark(args) -> int:
+    if args.what == "cluster":
+        return cmd_cluster_benchmark(args)
+    os.environ.setdefault("MESHTRAIN_QUIET", "1")
+    from meshtrain.experiments import pipeline_bench
+
+    if args.cluster:
+        if not args.config:
+            print("error: --cluster needs --config", file=sys.stderr)
+            return 2
+        r = pipeline_bench.run_cluster_benchmark(_client(args), _load_raw(args.config))
+        print(r["markdown"])
+        return 0
+    model = None
+    batch, mbs = args.batch_size, args.microbatches
+    if args.config:
+        from meshtrain.config import load_config
+
+        cfg = load_config(args.config)
+        model, batch, mbs = cfg.model.spec_kwargs(), cfg.training.batch_size, cfg.training.num_microbatches
+    devices = args.devices.split(",") if args.devices else None
+    r = pipeline_bench.run_local_benchmark(model, num_stages=len(devices) if devices else args.stages,
+                                           batch_size=batch, num_microbatches=mbs, steps=args.steps,
+                                           bandwidth_mbps=args.bandwidth_mbps or None, latency_ms=args.latency_ms,
+                                           devices=devices)
+    print(r["markdown"])
+    print(f"\nreport: docs/v1-vs-v1.5.md   timelines: {r['run_dir']}/timeline-*.json (chrome://tracing, Perfetto)")
+    return 0
+
+
 def format_benchmark(b: dict) -> str:
     from meshtrain.profiler.network import format_matrix
 
@@ -361,8 +391,15 @@ def _train_local(args) -> int:
     summary["parameters_changed"] = changed
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=str)
+    from meshtrain.runtime.trace_report import ascii_timeline, format_breakdown, write_run_timeline
+
+    lanes = [(r.stage_index, r.worker, r.timeline or []) for r in results]
+    trace = write_run_timeline(os.path.join(run_dir, "timeline.json"), lanes)
     print("\n" + format_summary(summary))
+    print("\n" + format_breakdown(summary))
+    print("\n" + ascii_timeline(lanes, step=len(losses) - 1))
     print(f"parameters changed per stage: {changed}")
+    print(f"timeline: {trace} (chrome://tracing or ui.perfetto.dev)")
     print(f"metrics: {run_dir}/metrics.jsonl")
     return 0 if summary["loss_decreased"] and all(changed.values()) else 1
 
@@ -460,12 +497,26 @@ def build_parser() -> argparse.ArgumentParser:
     cl = sub.add_parser("cluster").add_subparsers(dest="action", required=True)
     cl.add_parser("status", parents=[common]).set_defaults(func=cmd_cluster_status)
     for b in (cl.add_parser("benchmark", parents=[common]),
-              sub.add_parser("benchmark", parents=[common], help="measure compute and network of the cluster")):
+              sub.add_parser("benchmark", parents=[common],
+                             help="`benchmark` / `benchmark cluster`: compute + network of the cluster; "
+                                  "`benchmark pipeline`: V1 vs V1.5 execution modes")):
         b.add_argument("--pings", type=int, default=10)
         b.add_argument("--payload-mb", type=float, default=16.0)
         b.add_argument("--no-network", action="store_true")
         b.add_argument("--output", help="write raw results JSON (input for `experiment placement --cluster`)")
         b.set_defaults(func=cmd_cluster_benchmark)
+    b.add_argument("what", nargs="?", default="cluster", choices=["cluster", "pipeline"])
+    b.add_argument("--config", help="pipeline: model/training config (default: built-in tiny Transformer)")
+    b.add_argument("--stages", type=int, default=3, help="pipeline (local): number of stage processes")
+    b.add_argument("--devices", help="pipeline (local): one device per stage, e.g. cuda,cuda")
+    b.add_argument("--microbatches", type=int, default=8)
+    b.add_argument("--batch-size", type=int, default=32)
+    b.add_argument("--steps", type=int, default=8)
+    b.add_argument("--bandwidth-mbps", type=float, default=100.0,
+                   help="pipeline (local): emulated link bandwidth; 0 = raw loopback")
+    b.add_argument("--latency-ms", type=float, default=1.0)
+    b.add_argument("--cluster", action="store_true", help="pipeline: run the modes as jobs on the real cluster")
+    b.set_defaults(func=cmd_benchmark)
 
     pl = sub.add_parser("plan", parents=[common])
     pl.add_argument("config")

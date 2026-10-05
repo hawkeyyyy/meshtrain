@@ -180,7 +180,9 @@ class WorkerAgent:
                 metrics_callback=on_metrics, stop_event=stop, runs_dir=self.runs_dir, verbose=self.verbose)
             self._event("stage_done", {"job_id": job_id, "attempt": attempt, "stage": idx,
                                        "summary": {"steps": len(result.step_metrics), "wall_s": time.time() - t0,
-                                                   "final_loss": result.losses[-1] if result.losses else None}})
+                                                   "final_loss": result.losses[-1] if result.losses else None},
+                                       # compact spans for the coordinator's merged timeline.json
+                                       "timeline": (result.timeline or [])[-20_000:]})
         except Exception as exc:
             if stop.is_set():
                 self.log.log("STAGE_STOPPED", job_id=job_id, attempt=attempt)

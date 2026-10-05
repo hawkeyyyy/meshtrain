@@ -112,7 +112,12 @@ def test_three_worker_cluster_benchmark_and_training(cluster):
     losses = [l for _, l in j["losses"]]
     assert len(losses) == 40 and losses[-1] < losses[0]
     s = j["summary"]
-    assert set(map(int, s["stages"])) == {0, 1, 2}
+    from meshtrain.telemetry import read_jsonl
+    recs = read_jsonl(os.path.join(j["run_dir"], "metrics.jsonl"))
+    per = {}
+    for r in recs:
+        per.setdefault((r.get("event"), r.get("stage")), []).append(r.get("step"))
+    assert set(map(int, s["stages"])) == {0, 1, 2}, (sorted(s["stages"]), {k: len(v) for k, v in per.items()})
     assert s["bytes_per_step"] > 0
     assert os.path.exists(os.path.join(j["run_dir"], "metrics.jsonl"))
     acc = s["prediction_accuracy"]

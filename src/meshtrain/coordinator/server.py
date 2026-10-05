@@ -283,26 +283,44 @@ class Coordinator:
                     w.status = WorkerStatus.ONLINE
 
     def _finish(self, job: JobRecord, status: JobStatus, error: str | None = None) -> None:
-        job.status, job.error, job.finished_at = status, error, time.time()
+        # Write every artifact *before* publishing the final status: clients poll
+        # /jobs/{id} without the lock and must never see COMPLETED without a summary.
+        try:
+            job.summary = self._write_run_artifacts(job, status, error)
+        except Exception as exc:  # artifacts are best effort; finishing the job is not
+            self.log.log("ARTIFACT_WRITE_FAILED", job_id=job.job_id, error=f"{type(exc).__name__}: {exc}")
+        job.error, job.finished_at = error, time.time()
+        job.status = status
         self._release(job)
-        path = Path(job.run_dir) / "metrics.jsonl"
-        if path.exists():
-            s = summarize(read_jsonl(path))
-            s["status"], s["error"] = status.value, error
-            if job.plan and s.get("steps"):
-                from meshtrain.planner.report import prediction_accuracy
 
-                mem = {k: {"actual_peak_step0": None} for k in job.memory_reports}
-                for r in read_jsonl(path):
-                    if r.get("event") == "STEP_COMPLETE" and r.get("memory_validation") \
-                            and r.get("attempt", 0) == job.attempt:
-                        mem[str(r["stage"])] = r["memory_validation"]
-                s["prediction_accuracy"] = prediction_accuracy(job.plan, s, mem)
-                (Path(job.run_dir) / "prediction_accuracy.json").write_text(
-                    json.dumps(s["prediction_accuracy"], indent=2, default=str))
-            (Path(job.run_dir) / "summary.json").write_text(json.dumps(s, indent=2, default=str))
-            (Path(job.run_dir) / "summary.txt").write_text(format_summary(s) + "\n")
-            job.summary = s
+    def _write_run_artifacts(self, job: JobRecord, status: JobStatus, error: str | None) -> dict | None:
+        path = Path(job.run_dir) / "metrics.jsonl"
+        if not path.exists():
+            return None
+        s = summarize(read_jsonl(path))
+        s["status"], s["error"] = status.value, error
+        if job.plan and s.get("steps"):
+            from meshtrain.planner.report import prediction_accuracy
+
+            mem = {k: {"actual_peak_step0": None} for k in job.memory_reports}
+            for r in read_jsonl(path):
+                if r.get("event") == "STEP_COMPLETE" and r.get("memory_validation") \
+                        and r.get("attempt", 0) == job.attempt:
+                    mem[str(r["stage"])] = r["memory_validation"]
+            s["prediction_accuracy"] = prediction_accuracy(job.plan, s, mem)
+            (Path(job.run_dir) / "prediction_accuracy.json").write_text(
+                json.dumps(s["prediction_accuracy"], indent=2, default=str))
+        (Path(job.run_dir) / "summary.json").write_text(json.dumps(s, indent=2, default=str))
+        if job.timelines:
+            from meshtrain.runtime.trace_report import ascii_timeline, format_breakdown, write_run_timeline
+
+            lanes = [(idx, w, spans) for idx, (w, spans) in sorted(job.timelines.items())]
+            write_run_timeline(Path(job.run_dir) / "timeline.json", lanes)
+            last = max((x.get("step") or 0) for _, _, spans in lanes for x in spans)
+            (Path(job.run_dir) / "timeline_report.txt").write_text(
+                format_breakdown(s) + "\n\n" + ascii_timeline(lanes, last) + "\n")
+        (Path(job.run_dir) / "summary.txt").write_text(format_summary(s) + "\n")
+        return s
 
     def _fail_job(self, job: JobRecord, error: str) -> None:
         if job.status != JobStatus.RUNNING:
@@ -347,6 +365,8 @@ class Coordinator:
                     job.losses.append((rec["step"], rec["loss"]))
             elif ev.type == "stage_done":
                 job.stages_done[d["stage"]] = d.get("summary", {})
+                if d.get("timeline"):
+                    job.timelines[int(d["stage"])] = (worker_id, d["timeline"])
                 if job.status == JobStatus.RUNNING and all(i in job.stages_done for i in range(len(job.stage_workers))):
                     self.log.log("JOB_COMPLETED", job_id=job.job_id)
                     self._finish(job, JobStatus.COMPLETED)

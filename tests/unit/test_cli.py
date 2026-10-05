@@ -53,7 +53,12 @@ def test_short_commands_parse():
     a = p.parse_args(["join", "k3f9x2@192.168.1.20", "--device", "mps"])
     assert a.coordinator_address == "k3f9x2@192.168.1.20" and a.device == "mps"
     assert p.parse_args(["start", "--port", "9000"]).port == 9000
-    assert p.parse_args(["benchmark"]).func.__name__ == "cmd_cluster_benchmark"
+    b = p.parse_args(["benchmark"])
+    assert b.func.__name__ == "cmd_benchmark" and b.what == "cluster"
+    bp = p.parse_args(["benchmark", "pipeline", "--bandwidth-mbps", "50", "--devices", "cuda,cuda"])
+    assert bp.what == "pipeline" and bp.bandwidth_mbps == 50 and bp.devices == "cuda,cuda"
+    assert p.parse_args(["cluster", "benchmark"]).func.__name__ == "cmd_cluster_benchmark"
+    assert p.parse_args(["inspect", "placement", "c.yaml"]).config == "c.yaml"
 
 
 def test_capacity_hardware_uses_remembered_cluster(tmp_path, monkeypatch):

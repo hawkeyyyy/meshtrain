@@ -71,6 +71,7 @@ class JobRecord:
     attempts: list[dict] = field(default_factory=list)
     budget_overrides: dict[str, int] = field(default_factory=dict)
     memory_reports: dict[str, dict] = field(default_factory=dict)
+    timelines: dict[int, tuple] = field(default_factory=dict)  # stage -> (worker, spans); not in public()
 
     def public(self) -> dict[str, Any]:
         return {

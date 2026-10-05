@@ -108,3 +108,18 @@ def test_stress_four_stages_many_microbatches_many_steps():
             assert m["memory"]["saved_microbatches_peak"] <= 4 - r.stage_index
         allocs = [m["buffer_pool"]["allocation_count"] for m in r.step_metrics]
         assert allocs[-1] == allocs[1]  # bounded memory growth: no new buffers after warm-up
+
+
+def test_pipeline_benchmark_reports_all_modes(tmp_path):
+    from meshtrain.experiments.pipeline_bench import run_local_benchmark
+
+    cfg = {"type": "tiny_transformer", "layers": 2, "hidden_size": 64, "heads": 4, "vocab_size": 64, "seq_len": 16}
+    r = run_local_benchmark(cfg, num_stages=2, batch_size=8, num_microbatches=4, steps=3, bandwidth_mbps=50,
+                            runs_dir=str(tmp_path), write_doc=False)
+    modes = [row["mode"] for row in r["rows"]]
+    assert modes[0].startswith("V1:") and modes[-1].startswith("V1.5:")
+    assert all(row["loss_matches_v1"] in (None, True) for row in r["rows"])
+    v1, v15 = r["rows"][0], r["rows"][-1]
+    assert v15["peak_saved_mb_stage0"] <= v1["peak_saved_mb_stage0"]
+    import os
+    assert os.path.exists(os.path.join(r["run_dir"], "timeline-1f1b-async.json"))
