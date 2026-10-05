@@ -1,17 +1,14 @@
 # MeshTrain
 
-MeshTrain is an experimental distributed training runtime for combining heterogeneous consumer hardware to train and fine-tune models larger than a single device can comfortably handle.
+MeshTrain is an experimental research runtime for training one neural network across heterogeneous
+consumer machines (CUDA GPUs, Apple MPS, CPUs) by splitting it into pipeline stages and explicitly
+transmitting activations forward and activation-gradients backward over the network.
 
-Initial research direction:
+Status: **V1 in progress.** See `docs/architecture.md` and `docs/v1-results.md`.
 
-- distributed pipeline model parallelism
-- heterogeneous GPUs/computers
-- activation and gradient transfer between machines
-- LoRA/QLoRA training
-- topology-aware scheduling
-- later support for RAM/NVMe layer streaming
-
-Status: early research project.
+| Milestone | Status |
+|---|---|
+| 1. Local CPU prototype (separate processes, gradient equivalence) | done, verified on CPU |
 
 ## Development
 
