@@ -78,7 +78,8 @@ class PlacementConfig(_Strict):
     stages: list[StagePlacement] | None = None   # required for manual
     memory_headroom_fraction: float = Field(0.15, ge=0, lt=1)
     memory_headroom_min_gb: float = Field(0.5, ge=0)
-    activation_overhead_factor: float = Field(4.0, ge=1)
+    # Safety multiplier on the measured autograd-saved bytes (planner/memory.py).
+    activation_overhead_factor: float = Field(1.25, ge=1)
 
     @model_validator(mode="after")
     def _check(self):
