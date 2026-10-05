@@ -1,0 +1,27 @@
+# Development/testing: MLP split across CPU workers (or local processes with --local).
+job:
+  name: mlp-cpu
+  seed: 0
+
+model:
+  type: mlp
+  sizes: [128, 512, 512, 256, 10]
+
+training:
+  batch_size: 64
+  microbatch_size: 16
+  learning_rate: 0.001
+  optimizer: adam
+  steps: 200
+  log_every: 25
+
+placement:
+  strategy: equal
+  num_stages: 2
+
+workers:
+  allow: [cpu, cuda, mps]
+
+network:
+  tensor_transport: tcp
+  timeout_s: 60

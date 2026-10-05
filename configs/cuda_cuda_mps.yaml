@@ -1,0 +1,30 @@
+# Scenario B: CUDA -> CUDA -> Apple MPS (stage 3 + loss on the Mac).
+job:
+  name: cuda-cuda-mps-transformer
+
+model:
+  type: tiny_transformer
+  layers: 12
+  hidden_size: 512
+  heads: 8
+  vocab_size: 1024
+  seq_len: 128
+
+training:
+  batch_size: 16
+  microbatch_size: 4
+  learning_rate: 0.0003
+  optimizer: adamw
+  steps: 500
+  log_every: 25
+
+placement:
+  strategy: auto
+  num_stages: 3
+
+workers:
+  allow: [cuda, mps]
+
+network:
+  tensor_transport: tcp
+  timeout_s: 120
