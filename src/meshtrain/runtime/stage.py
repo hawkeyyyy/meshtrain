@@ -91,7 +91,7 @@ class Stage:
         with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
             out = self.module(x)
         context.autograd_saved_bytes = saved
-        self.device.synchronize()
+        self.device.sync_compute()
         context.input, context.output = x, out
         context.timings["forward"] = time.perf_counter() - t0
         self.contexts.put(context)
@@ -111,7 +111,7 @@ class Stage:
         loss = self.loss_fn(out, self.device.move_tensor(target))
         self.contexts.pop(context.step_id, context.microbatch_id)
         (loss * loss_scale).backward()
-        self.device.synchronize()
+        self.device.sync_compute()
         context.timings["backward"] = time.perf_counter() - t0
         grad = boundary_input_grad(context.input)
         context.input = context.output = None
@@ -129,7 +129,7 @@ class Stage:
         t0 = time.perf_counter()
         loss = self.loss_fn(ctx.output, self.device.move_tensor(target))
         (loss * loss_scale).backward()
-        self.device.synchronize()
+        self.device.sync_compute()
         ctx.timings["backward"] = time.perf_counter() - t0
         grad = boundary_input_grad(ctx.input) if not self.is_first else None
         ctx.input = ctx.output = None
@@ -140,7 +140,7 @@ class Stage:
         ctx = self.contexts.pop(*context_key)
         t0 = time.perf_counter()
         boundary_backward(ctx.output, self.device.move_tensor(grad_output))
-        self.device.synchronize()
+        self.device.sync_compute()
         ctx.timings["backward"] = time.perf_counter() - t0
         grad = boundary_input_grad(ctx.input) if not self.is_first else None
         ctx.input = ctx.output = None
@@ -152,7 +152,7 @@ class Stage:
         t0 = time.perf_counter()
         if self.optimizer is not None:
             self.optimizer.step()
-        self.device.synchronize()
+        self.device.sync_compute()
         return time.perf_counter() - t0
 
     def zero_grad(self) -> None:

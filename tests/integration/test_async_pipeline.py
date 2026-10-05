@@ -154,3 +154,18 @@ def test_buffer_pool_can_be_disabled():
                          buffer_pool=False)
     res = run_local_pipeline(MLP, stages, s, transport="tcp")
     assert res[1].step_metrics[-1]["buffer_pool"]["reuse_count"] == 0
+
+
+def test_async_overlaps_communication_with_compute():
+    cfg = {"type": "tiny_transformer", "layers": 4, "hidden_size": 128, "heads": 4, "vocab_size": 128,
+           "seq_len": 32}
+    stages = [LocalStage((0, 3)), LocalStage((3, 6))]
+    common = dict(steps=4, batch_size=16, num_microbatches=8, schedule="1f1b")
+    sync = run_local_pipeline(cfg, stages, PipelineSettings("s", **common), link_emulation=(5e6, 0.001))
+    asyn = run_local_pipeline(cfg, stages, PipelineSettings("a", async_transport=True, **common),
+                              link_emulation=(5e6, 0.001))
+    ov = lambda res: sum(m["overlapped_s"] for r in res for m in r.step_metrics[1:])  # noqa: E731
+    ratio = lambda res: max(m["overlap_ratio"] for r in res for m in r.step_metrics[1:])  # noqa: E731
+    assert ov(sync) < 1e-3 and ratio(sync) < 0.01   # blocking sends never overlap
+    assert ov(asyn) > 0.01 and ratio(asyn) > 0.1    # async sends do, and it is measured
+    assert asyn[0].losses == pytest.approx(sync[0].losses, rel=1e-6)

@@ -73,7 +73,13 @@ class DeviceAdapter(abc.ABC):
         return module.to(self.device)
 
     def synchronize(self) -> None:
-        """Block until queued kernels finish (no-op on CPU)."""
+        """Block until all queued device work finishes (no-op on CPU)."""
+
+    def sync_compute(self) -> None:
+        """Block until the *compute* stream is idle. Used to time forward/
+        backward on the host; unlike ``synchronize`` it does not wait for
+        transfers running on other streams, so copies keep overlapping."""
+        self.synchronize()
 
     def begin_d2h(self, tensor: torch.Tensor):
         """Start staging ``tensor`` to host memory for sending.
@@ -191,6 +197,9 @@ class CUDADeviceAdapter(DeviceAdapter):
 
     def synchronize(self) -> None:
         torch.cuda.synchronize(self.device)
+
+    def sync_compute(self) -> None:
+        torch.cuda.current_stream(self.device).synchronize()
 
     def begin_d2h(self, tensor: torch.Tensor):
         t = tensor.detach()
