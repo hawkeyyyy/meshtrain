@@ -29,7 +29,7 @@ from meshtrain.networking.protocol import (
     ProtocolError,
     decode_body,
     decode_packet,
-    encode_packet,
+    encode_head,
     parse_prefix,
 )
 from meshtrain.runtime.serialization import TensorLifecycle, packet_to_tensor, tensor_to_packet
@@ -61,6 +61,10 @@ class Transport(abc.ABC):
     @abc.abstractmethod
     def _send_frame(self, frame: bytes) -> None: ...
 
+    def _send_parts(self, head: bytes, payload) -> None:
+        """Send a frame given as header + payload (override for zero-copy)."""
+        self._send_frame(head + bytes(payload))
+
     @abc.abstractmethod
     def _recv_packet(self, timeout: float | None) -> tuple[TensorPacket, int]: ...
 
@@ -72,11 +76,11 @@ class Transport(abc.ABC):
         """Send a packet; returns seconds spent in the network send."""
         if len(packet.payload) > self.max_payload_bytes:
             raise ProtocolError(f"payload {len(packet.payload)} exceeds limit {self.max_payload_bytes}")
-        frame = encode_packet(packet)
+        head = encode_head(packet)
         t0 = time.perf_counter()
         with self._send_lock:
-            self._send_frame(frame)
-        self.bytes_sent += len(frame)
+            self._send_parts(head, packet.payload)
+        self.bytes_sent += len(head) + len(packet.payload)
         return time.perf_counter() - t0
 
     def recv_packet(self, timeout: float | None = None) -> TensorPacket:

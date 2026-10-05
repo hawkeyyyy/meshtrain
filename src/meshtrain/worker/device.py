@@ -38,6 +38,20 @@ class DeviceAdapter(abc.ABC):
     def synchronize(self) -> None:
         """Block until queued kernels finish (no-op on CPU)."""
 
+    def begin_d2h(self, tensor: torch.Tensor):
+        """Start staging ``tensor`` to host memory for sending.
+
+        Called on the compute thread (so it is ordered after the kernels that
+        produced ``tensor``). Returns ``finish() -> (cpu_tensor, release)``,
+        which may run on another thread; ``release`` (or None) returns any
+        staging buffer to its pool once the bytes are sent.
+
+        Default: synchronous copy now, nothing left to do later.
+        """
+        cpu = tensor.detach().to("cpu")
+        self.synchronize()
+        return lambda: (cpu, None)
+
     @abc.abstractmethod
     def name(self) -> str: ...
 
@@ -79,6 +93,11 @@ class CPUDeviceAdapter(DeviceAdapter):
     @property
     def device(self) -> torch.device:
         return torch.device("cpu")
+
+    def begin_d2h(self, tensor: torch.Tensor):
+        # Already in host memory: send straight from the tensor (no copy).
+        t = tensor.detach()
+        return lambda: (t, None)
 
     def name(self) -> str:
         return platform.processor() or platform.machine() or "cpu"

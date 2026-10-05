@@ -117,6 +117,24 @@ class Stage:
         context.input = context.output = None
         return loss.detach(), grad
 
+    def loss_backward(self, target: torch.Tensor, context_key: tuple[int, int],
+                      loss_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor | None, MicrobatchContext]:
+        """Last stage: loss on the saved output of one microbatch, then backward.
+
+        Returns (unscaled loss, gradient w.r.t. the stage input, context).
+        """
+        if not self.is_last:
+            raise BoundaryError("loss_backward is only valid on the last stage")
+        ctx = self.contexts.pop(*context_key)
+        t0 = time.perf_counter()
+        loss = self.loss_fn(ctx.output, self.device.move_tensor(target))
+        (loss * loss_scale).backward()
+        self.device.synchronize()
+        ctx.timings["backward"] = time.perf_counter() - t0
+        grad = boundary_input_grad(ctx.input) if not self.is_first else None
+        ctx.input = ctx.output = None
+        return loss.detach(), grad, ctx
+
     def backward(self, grad_output: torch.Tensor, context_key: tuple[int, int]) -> tuple[torch.Tensor | None, MicrobatchContext]:
         """Backprop a received gradient through the saved graph of one microbatch."""
         ctx = self.contexts.pop(*context_key)

@@ -47,8 +47,13 @@ class TensorLifecycle:
         return _Timer()
 
 
-def tensor_to_bytes(tensor: torch.Tensor) -> tuple[bytes, str, tuple[int, ...]]:
-    """Return (raw bytes, dtype name, shape) for a CPU tensor."""
+def tensor_to_bytes(tensor: torch.Tensor, copy: bool = True) -> tuple[bytes | memoryview, str, tuple[int, ...]]:
+    """Return (raw bytes, dtype name, shape) for a CPU tensor.
+
+    ``copy=False`` returns a zero-copy ``memoryview`` of the tensor's memory:
+    the caller must keep the tensor alive and unmodified until the bytes have
+    been sent (the async outbox does).
+    """
     if tensor.device.type != "cpu":
         raise ValueError("tensor_to_bytes expects a CPU tensor; stage it first")
     if tensor.dtype not in DTYPE_TO_NAME:
@@ -58,7 +63,8 @@ def tensor_to_bytes(tensor: torch.Tensor) -> tuple[bytes, str, tuple[int, ...]]:
     if t.numel() == 0:
         return b"", DTYPE_TO_NAME[t.dtype], shape
     # Reinterpret as bytes; works for bfloat16/bool too (numpy has no bf16).
-    raw = t.reshape(-1).view(torch.uint8).numpy().tobytes()
+    arr = t.reshape(-1).view(torch.uint8).numpy()
+    raw = arr.tobytes() if copy else memoryview(arr).cast("B")
     return raw, DTYPE_TO_NAME[t.dtype], shape
 
 

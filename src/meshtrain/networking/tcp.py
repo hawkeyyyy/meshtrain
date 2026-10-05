@@ -58,6 +58,11 @@ class TCPTransport(Transport):
         except OSError as exc:
             raise TransportClosed(f"send to {self.peer} failed: {exc}") from exc
 
+    def _send_parts(self, head: bytes, payload) -> None:
+        self._send_frame(head)
+        if len(payload):
+            self._send_frame(payload)
+
     def _recv_packet(self, timeout):
         # Wait for the *start* of a frame with ``timeout``; once a frame has
         # started, read all of it (bounded by frame_timeout_s) so we never
@@ -68,10 +73,12 @@ class TCPTransport(Transport):
             raise TransportClosed(f"connection to {self.peer} closed: {exc}") from exc
         if not ready:
             raise TransportTimeout(f"no packet from {self.peer} within {timeout}s")
+        t0 = time.perf_counter()
         prefix = _recv_exact(self.sock, PREFIX_SIZE)
         header_len, payload_len = parse_prefix(prefix, self.max_payload_bytes)
         header = _recv_exact(self.sock, header_len)
         payload = _recv_exact(self.sock, payload_len) if payload_len else b""
+        self.last_frame_s = time.perf_counter() - t0  # time on the wire once the frame started
         return decode_body(header, payload), PREFIX_SIZE + header_len + payload_len
 
     def close(self) -> None:

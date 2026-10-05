@@ -35,11 +35,16 @@ class ProtocolError(ValueError):
     """Raised for malformed, oversized or otherwise invalid frames."""
 
 
-def encode_packet(packet: TensorPacket) -> bytes:
+def encode_head(packet: TensorPacket) -> bytes:
+    """Prefix + JSON header; the payload is sent separately (zero-copy)."""
     header = json.dumps(packet.header(), separators=(",", ":")).encode("utf-8")
     if len(header) > MAX_HEADER_BYTES:
         raise ProtocolError(f"header too large ({len(header)} bytes)")
-    return PREFIX.pack(MAGIC, VERSION, 0, len(header), len(packet.payload)) + header + packet.payload
+    return PREFIX.pack(MAGIC, VERSION, 0, len(header), len(packet.payload)) + header
+
+
+def encode_packet(packet: TensorPacket) -> bytes:
+    return encode_head(packet) + bytes(packet.payload)
 
 
 def parse_prefix(prefix: bytes, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> tuple[int, int]:

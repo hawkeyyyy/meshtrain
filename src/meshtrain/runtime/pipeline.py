@@ -1,23 +1,37 @@
-"""Synchronous GPipe-style pipeline execution for one stage.
+"""Schedule-driven pipeline execution for one stage (V1.5).
 
-Every stage runs ``run_stage`` with links to its neighbours:
+Each stage runs ``run_stage`` with links to its neighbours. Per global step::
 
-* stage 0 owns the data: it splits each batch into M microbatches, runs all
-  M forwards (sending activations + targets downstream), then waits for M
-  gradients and backpropagates each into the saved graph of that microbatch.
-* middle stages are event driven (forward on activation, backward on
-  gradient, relay targets).
-* the last stage pairs each activation with its target, computes the loss
-  (scaled by 1/M) and backpropagates immediately.
+    state machine  <- schedule (gpipe | 1f1b) for (stage, S, M)
+    loop over actions in schedule order:
+        wait until the action is ready  (WAIT_FORWARD / WAIT_BACKWARD spans)
+            -- inbound events: activations, gradients, targets, send completions
+        FORWARD:  stage.forward(...)  -> submit activation to the outbox
+        BACKWARD: stage.backward(...) or loss_backward (last stage)
+                  -> submit input-gradient upstream
+    optimizer.step(); zero_grad()          (once per global step)
 
-After its M-th backward a stage runs its optimizer step. Because each stage
-processes its inbox on one thread, step s+1 cannot start before step s's
-update: training is synchronous and matches single-process gradient
-accumulation.
+Threads per stage:
+
+* compute thread  -- this function: schedule, forward/backward, optimizer,
+                     host-to-device copies of received tensors.
+* reader thread   -- one per link: receive + deserialize into a *bounded*
+                     event queue (back-pressure to the TCP peer when full).
+* sender thread   -- one per link in async mode (see ``outbox.py``).
+
+Training semantics are unchanged from V1: all microbatches of a step use the
+same parameters, gradients accumulate over the M microbatches (loss scaled
+by 1/M) and every stage steps its optimizer exactly once per global step.
+GPipe and 1F1B only reorder work inside that step.
+
+If nothing happens for ``timeout_s`` the stage raises with a state dump
+(current action, queues, buffered messages, saved contexts) instead of
+hanging.
 """
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -29,9 +43,12 @@ import torch
 from meshtrain.models.base import ModelSpec
 from meshtrain.networking.transport import Transport, TransportClosed, TransportTimeout
 from meshtrain.runtime.distributed_autograd import BoundaryError, MicrobatchContext
-from meshtrain.runtime.serialization import TensorLifecycle, packet_to_tensor
+from meshtrain.runtime.outbox import Outbox, OutboxError
+from meshtrain.runtime.scheduler import ActionKind, Event, StageStateMachine
+from meshtrain.runtime.serialization import bytes_to_tensor
 from meshtrain.runtime.stage import Stage
 from meshtrain.runtime.tensor_packet import MessageType, TensorPacket
+from meshtrain.runtime.timeline import Timeline
 from meshtrain.telemetry import EventLogger
 
 UPSTREAM = "upstream"
@@ -57,6 +74,12 @@ class PipelineSettings:
     capture_gradients_at_step: int | None = None  # record grads before optimizer step
     step_offset: int = 0
     log_microbatch_events: bool = False
+    # V1.5
+    schedule: str = "gpipe"                 # gpipe | 1f1b
+    max_inflight_microbatches: int | None = None  # 1f1b: cap on saved microbatch graphs
+    async_transport: bool = False           # False = V1 blocking sends on the compute thread
+    max_outbound_queue: int | None = None   # default 2*M + 4 messages per link
+    trace: bool = True                      # keep every timeline span (else only the current step)
 
 
 @dataclass
@@ -69,66 +92,62 @@ class StageResult:
     initial_params: dict[str, torch.Tensor] | None = None
     final_params: dict[str, torch.Tensor] | None = None
     error: str | None = None
+    timeline: list[dict] | None = None
 
 
 class Inbox:
-    """Merges packets from several transports into one queue (one reader thread each)."""
+    """Reader thread per link -> one bounded event queue shared with the outbox."""
 
-    def __init__(self, links: dict[str, Transport], poll_s: float = 0.2):
-        self.queue: queue.Queue = queue.Queue()
+    def __init__(self, links: dict[str, Transport], timeline: Timeline, maxsize: int, poll_s: float = 0.2):
+        self.queue: queue.Queue = queue.Queue(maxsize=maxsize)
+        self.timeline = timeline
+        self.peak_depth = 0
         self._stop = threading.Event()
-        self._threads = []
         for name, link in links.items():
-            t = threading.Thread(target=self._reader, args=(name, link, poll_s), daemon=True,
-                                 name=f"inbox-{name}")
-            t.start()
-            self._threads.append(t)
+            threading.Thread(target=self._reader, args=(name, link, poll_s), daemon=True,
+                             name=f"recv-{name}").start()
 
-    def _reader(self, name: str, link: Transport, poll_s: float) -> None:
+    def _put(self, item) -> bool:
         while not self._stop.is_set():
             try:
-                t0 = time.perf_counter()
+                self.queue.put(item, timeout=0.2)
+                self.peak_depth = max(self.peak_depth, self.queue.qsize())
+                return True
+            except queue.Full:
+                continue  # back-pressure: stop reading from the socket until the executor drains
+        return False
+
+    def _reader(self, name: str, link: Transport, poll_s: float) -> None:
+        tl = self.timeline
+        while not self._stop.is_set():
+            try:
                 packet = link.recv_packet(timeout=poll_s)
-                self.queue.put((name, packet, time.perf_counter() - t0, None))
             except TransportTimeout:
                 continue
             except Exception as exc:  # closed peer, malformed frame, ...
                 if not self._stop.is_set():
-                    self.queue.put((name, None, 0.0, exc))
+                    self._put(("error", name, exc))
                 return
-
-    def get(self, timeout: float) -> tuple[str, TensorPacket, float]:
-        try:
-            name, packet, recv_s, exc = self.queue.get(timeout=timeout)
-        except queue.Empty:
-            raise InboxTimeout(f"timed out after {timeout}s waiting for a peer packet") from None
-        if exc is not None:
-            if isinstance(exc, TransportClosed):
-                raise PipelineError(f"{name} peer disconnected: {exc}") from exc
-            raise PipelineError(f"{name} link failed: {exc}") from exc
-        if packet.message_type == MessageType.ERROR:
-            raise PipelineError(f"{name} peer reported error: {packet.meta.get('error')}")
-        return name, packet, recv_s
+            end = tl.now()
+            frame_s = getattr(link, "last_frame_s", 0.0)
+            tl.add("NETWORK_RECV", end - frame_s, end, packet.step_id, packet.microbatch_id, link=name,
+                   bytes=len(packet.payload))
+            tensor = None
+            if packet.has_tensor:
+                with tl.span("DESERIALIZE", packet.step_id, packet.microbatch_id):
+                    tensor = bytes_to_tensor(packet.payload, packet.dtype, packet.shape)
+            if not self._put(("packet", name, packet, tensor)):
+                return
 
     def stop(self) -> None:
         self._stop.set()
 
 
-class _StepStats:
+class _StepBuffers:
     def __init__(self):
-        self.forward_s = 0.0
-        self.backward_s = 0.0
-        self.comm_s = 0.0  # staging + (de)serialization + socket time
-        self.idle_s = 0.0
-        self.bytes_sent = 0
-        self.bytes_received = 0
-        self.lifecycle: dict[str, float] = {}
-        self.peak_saved_bytes = 0
-
-    def add_lifecycle(self, lc: TensorLifecycle) -> None:
-        for k, v in lc.timings.items():
-            self.lifecycle[k] = self.lifecycle.get(k, 0.0) + v
-            self.comm_s += v
+        self.acts: dict[int, torch.Tensor] = {}
+        self.targets: dict[int, torch.Tensor] = {}
+        self.grads: dict[int, tuple[torch.Tensor, dict]] = {}
 
 
 def run_stage(
@@ -143,6 +162,7 @@ def run_stage(
     metrics_callback: Callable[[dict], None] | None = None,
     stop_event: threading.Event | None = None,
     capture_params: bool = False,
+    timeline: Timeline | None = None,
 ) -> StageResult:
     logger = logger or EventLogger(worker, settings.job_id)
     if (upstream is None) != stage.is_first or (downstream is None) != stage.is_last:
@@ -150,156 +170,217 @@ def run_stage(
     M = settings.num_microbatches
     if settings.batch_size % M:
         raise PipelineError("batch_size must be divisible by num_microbatches")
+    S, sidx = stage.num_stages, stage.stage_index
     links = {k: v for k, v in ((UPSTREAM, upstream), (DOWNSTREAM, downstream)) if v is not None}
-    inbox = Inbox(links) if links else None
-    result = StageResult(stage.stage_index, worker)
+    tl = timeline or Timeline(worker, sidx)
+    max_out = settings.max_outbound_queue or (2 * M + 4)
+    inbox = Inbox(links, tl, maxsize=4 * M + 16) if links else None
+    events = inbox.queue if inbox else queue.Queue()
+    outbox = Outbox(links, tl, async_mode=settings.async_transport, max_queue=max_out,
+                    timeout_s=settings.timeout_s, events=events)
+    result = StageResult(sidx, worker)
     if capture_params:
         result.initial_params = stage.named_parameters_cpu()
     dev = stage.device
+    future: dict[int, list] = {}          # buffered (link, packet, tensor) for later steps
+    st: dict = {}                          # current step state: sm, bufs, step
 
-    def send(link: Transport, tensor: torch.Tensor, mtype: MessageType, step: int, mb: int,
-             stats: _StepStats, meta: dict | None = None) -> None:
-        lc = TensorLifecycle()
-        before = link.bytes_sent
-        link.send_tensor(tensor, mtype, device=dev, lifecycle=lc, job_id=settings.job_id, step_id=step,
-                         microbatch_id=mb, source_worker=worker, meta=meta or {})
-        stats.add_lifecycle(lc)
-        stats.bytes_sent += link.bytes_sent - before
-        if settings.log_microbatch_events:
-            direction = "→ downstream" if link is downstream else "→ upstream"
-            logger.log("TRANSFER", step, mb, type=mtype.name, direction=direction, bytes=lc.nbytes,
-                       time_s=sum(lc.timings.values()))
+    def fail_dump(reason: str) -> PipelineError:
+        dump = {
+            "reason": reason, "worker": worker, "stage": sidx,
+            "state": st["sm"].snapshot() if st.get("sm") else None,
+            "buffered": {k: sorted(getattr(st["bufs"], k)) for k in ("acts", "targets", "grads")} if st.get("bufs") else None,
+            "future_steps": {s: len(v) for s, v in future.items()},
+            "saved_contexts": [list(k) for k in stage.contexts.pending()],
+            "pending_sends": outbox.pending(),
+            "inbound_queue": events.qsize(),
+        }
+        logger.log("PIPELINE_STALLED", None, None, dump=json.dumps(dump))
+        return PipelineError(f"{reason}; state: {json.dumps(dump)}")
 
-    def receive(stats: _StepStats) -> tuple[str, TensorPacket]:
-        t0 = time.perf_counter()
-        while True:
-            if stop_event is not None and stop_event.is_set():
-                raise PipelineError("job stopped")
-            try:
-                name, packet, _ = inbox.get(timeout=min(settings.timeout_s, 1.0))
-                break
-            except InboxTimeout:
-                if time.perf_counter() - t0 < settings.timeout_s:
-                    continue
-                raise InboxTimeout(f"no packet from any peer within network timeout {settings.timeout_s}s") from None
-        stats.idle_s += time.perf_counter() - t0
-        stats.bytes_received += len(packet.payload)
+    # -- inbound routing ------------------------------------------------------
+    def apply(link: str, packet: TensorPacket, tensor) -> None:
+        sm, bufs = st["sm"], st["bufs"]
+        mb, mtype = packet.microbatch_id, packet.message_type
+        if mtype == MessageType.TARGET and link == UPSTREAM:
+            bufs.targets[mb] = tensor
+            if mb in bufs.acts:
+                sm.on(Event.ACTIVATION_RECEIVED, mb)
+        elif mtype == MessageType.FORWARD_ACTIVATION and link == UPSTREAM:
+            if mb in bufs.acts:
+                raise BoundaryError(f"duplicate activation for step {packet.step_id} microbatch {mb}")
+            bufs.acts[mb] = tensor
+            if not stage.is_last or mb in bufs.targets:
+                sm.on(Event.ACTIVATION_RECEIVED, mb)
+        elif mtype == MessageType.BACKWARD_GRADIENT and link == DOWNSTREAM:
+            bufs.grads[mb] = (tensor, dict(packet.meta))
+            sm.on(Event.GRADIENT_RECEIVED, mb)
+        else:
+            raise BoundaryError(f"unexpected {mtype.name} from {link}")
+
+    def pump(timeout: float) -> bool:
+        """Handle one event; False if none arrived within ``timeout``."""
+        if stop_event is not None and stop_event.is_set():
+            raise PipelineError("job stopped")
+        try:
+            item = events.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        kind = item[0]
+        if kind == "error":
+            _, name, exc = item
+            if isinstance(exc, TransportClosed):
+                raise PipelineError(f"{name} peer disconnected: {exc}") from exc
+            raise PipelineError(f"{name} link failed: {exc}") from exc
+        if kind == "send_error":
+            _, name, exc = item
+            raise PipelineError(f"send to {name} peer failed: {type(exc).__name__}: {exc}") from exc
+        if kind == "send_done":
+            _, _name, step_id, mb = item
+            if st.get("sm") is not None and step_id == st["step"]:
+                st["sm"].on(Event.SEND_COMPLETED, mb)
+            return True
+        _, link, packet, tensor = item
+        if packet.message_type == MessageType.ERROR:
+            raise PipelineError(f"{link} peer reported error: {packet.meta.get('error')}")
         if packet.job_id != settings.job_id:
             raise BoundaryError(f"packet for job {packet.job_id!r} received in job {settings.job_id!r}")
-        return name, packet
+        st["bytes_received"] += len(packet.payload)
+        if packet.message_type == MessageType.TARGET and not stage.is_last:
+            outbox.submit_packet(DOWNSTREAM, packet)  # relay unchanged
+            return True
+        step_id = packet.step_id
+        if step_id == st["step"]:
+            apply(link, packet, tensor)
+        elif step_id == st["step"] + 1:
+            future.setdefault(step_id, []).append((link, packet, tensor))
+        else:
+            raise BoundaryError(f"packet for step {step_id} while in step {st['step']}")
+        return True
 
-    def to_tensor(packet: TensorPacket, stats: _StepStats) -> torch.Tensor:
-        lc = TensorLifecycle()
-        t = packet_to_tensor(packet, device=dev, lifecycle=lc)
-        stats.add_lifecycle(lc)
-        return t
+    def wait_until_ready(action, step: int) -> None:
+        sm = st["sm"]
+        if sm.ready(action):
+            return
+        cat = "WAIT_FORWARD" if action.kind == ActionKind.FORWARD else "WAIT_BACKWARD"
+        t0 = tl.now()
+        last_progress = time.monotonic()
+        while not sm.ready(action):
+            if pump(min(settings.timeout_s, 0.5)):
+                last_progress = time.monotonic()
+            elif time.monotonic() - last_progress > settings.timeout_s:
+                raise fail_dump(f"pipeline stalled: no progress within network timeout {settings.timeout_s}s "
+                                f"waiting for {action}")
+        tl.add(cat, t0, tl.now(), step, action.microbatch)
+
+    def h2d(tensor: torch.Tensor, step: int, mb: int) -> torch.Tensor:
+        if dev.backend == "cpu":
+            return tensor
+        with tl.span("H2D_COPY", step, mb):
+            out = dev.move_tensor(tensor)
+            dev.synchronize()
+        return out
 
     try:
         for local_step in range(settings.steps):
             step = settings.step_offset + local_step
-            stats = _StepStats()
-            t_step = time.perf_counter()
+            t_step0 = tl.now()
             if stage.is_first:
                 dev.reset_peak_memory()
-            loss_sum = 0.0
-            done = 0
-
+            sm = StageStateMachine(sidx, S, M, step, settings.schedule, settings.max_inflight_microbatches)
+            st.update(sm=sm, bufs=_StepBuffers(), step=step, bytes_received=st.get("bytes_received", 0))
+            bytes_recv0, sent0 = st["bytes_received"], dict(outbox.bytes_sent)
+            for link, packet, tensor in future.pop(step, []):
+                apply(link, packet, tensor)
             if stage.is_first:
                 x, y = spec.make_batch(step, settings.batch_size)
                 xs, ys = x.chunk(M), y.chunk(M)
-                for mb in range(M):
+            loss_sum = 0.0
+            peak_saved_bytes = peak_saved_mbs = 0
+            bufs = st["bufs"]
+
+            while not sm.done:
+                action = sm.next_action()
+                mb = action.microbatch
+                wait_until_ready(action, step)
+                if action.kind == ActionKind.FORWARD:
+                    if stage.is_first:
+                        inp = xs[mb]
+                        if not stage.is_last:
+                            outbox.submit_tensor(DOWNSTREAM, ys[mb], MessageType.TARGET, device=_HOST, step=step,
+                                                 microbatch=mb, job_id=settings.job_id, source_worker=worker)
+                    else:
+                        inp = h2d(bufs.acts.pop(mb), step, mb)
                     ctx = MicrobatchContext(step, mb)
-                    if stage.is_last:  # single-stage pipeline
-                        loss, _ = stage.forward_loss(xs[mb], ys[mb], ctx, loss_scale=1.0 / M)
-                        stats.peak_saved_bytes = max(stats.peak_saved_bytes, ctx.peak_saved_bytes)
-                        loss_sum += float(loss)
-                        stats.forward_s += ctx.timings["forward"]
-                        stats.backward_s += ctx.timings["backward"]
-                        done += 1
-                        continue
-                    out = stage.forward(xs[mb], ctx)
-                    stats.forward_s += ctx.timings["forward"]
-                    stats.peak_saved_bytes = max(stats.peak_saved_bytes, stage.contexts.saved_bytes())
-                    send(downstream, ys[mb], MessageType.TARGET, step, mb, stats)
-                    send(downstream, out.detach(), MessageType.FORWARD_ACTIVATION, step, mb, stats)
+                    sm.on(Event.FORWARD_STARTED, mb)
+                    with tl.span("FORWARD_COMPUTE", step, mb):
+                        out = stage.forward(inp, ctx)
+                    sm.on(Event.FORWARD_FINISHED, mb)
+                    peak_saved_bytes = max(peak_saved_bytes, stage.contexts.saved_bytes())
+                    peak_saved_mbs = max(peak_saved_mbs, len(stage.contexts))
+                    if not stage.is_last:
+                        outbox.submit_tensor(DOWNSTREAM, out.detach(), MessageType.FORWARD_ACTIVATION, device=dev,
+                                             step=step, microbatch=mb, notify=True, job_id=settings.job_id,
+                                             source_worker=worker)
                     if settings.log_microbatch_events:
                         logger.log("FORWARD_COMPLETE", step, mb, output=out.numel() * out.element_size(),
                                    compute_s=ctx.timings["forward"])
-
-            pending_act: dict[int, torch.Tensor] = {}
-            pending_tgt: dict[int, torch.Tensor] = {}
-            while done < M:
-                name, packet = receive(stats)
-                mb = packet.microbatch_id
-                if packet.step_id != step:
-                    raise BoundaryError(f"packet for step {packet.step_id} while in step {step}")
-                mtype = packet.message_type
-                if mtype == MessageType.TARGET and name == UPSTREAM:
+                else:
+                    sm.on(Event.BACKWARD_STARTED, mb)
                     if stage.is_last:
-                        pending_tgt[mb] = to_tensor(packet, stats)
-                    else:  # relay unchanged
-                        before = downstream.bytes_sent
-                        packet.source_worker = worker
-                        stats.comm_s += downstream.send_packet(packet)
-                        stats.bytes_sent += downstream.bytes_sent - before
-                elif mtype == MessageType.FORWARD_ACTIVATION and name == UPSTREAM:
-                    act = to_tensor(packet, stats)
-                    if stage.is_last:
-                        pending_act[mb] = act
+                        target = ys[mb] if stage.is_first else bufs.targets.pop(mb)
+                        with tl.span("BACKWARD_COMPUTE", step, mb):
+                            loss, grad_in, ctx = stage.loss_backward(target, (step, mb), loss_scale=1.0 / M)
+                        meta = {"loss": float(loss)}
                     else:
-                        ctx = MicrobatchContext(step, mb)
-                        out = stage.forward(act, ctx)
-                        stats.forward_s += ctx.timings["forward"]
-                        stats.peak_saved_bytes = max(stats.peak_saved_bytes, stage.contexts.saved_bytes())
-                        send(downstream, out.detach(), MessageType.FORWARD_ACTIVATION, step, mb, stats)
-                        if settings.log_microbatch_events:
-                            logger.log("FORWARD_COMPLETE", step, mb, output=out.numel() * out.element_size(),
-                                       compute_s=ctx.timings["forward"])
-                elif mtype == MessageType.BACKWARD_GRADIENT and name == DOWNSTREAM:
-                    grad = to_tensor(packet, stats)
-                    grad_in, ctx = stage.backward(grad, (step, mb))
-                    stats.backward_s += ctx.timings["backward"]
-                    loss_sum += float(packet.meta.get("loss", 0.0))
+                        grad, meta = bufs.grads.pop(mb)
+                        grad = h2d(grad, step, mb)
+                        with tl.span("BACKWARD_COMPUTE", step, mb):
+                            grad_in, ctx = stage.backward(grad, (step, mb))
+                    sm.on(Event.BACKWARD_FINISHED, mb)
+                    loss_sum += float(meta.get("loss", 0.0))
                     if not stage.is_first:
-                        send(upstream, grad_in, MessageType.BACKWARD_GRADIENT, step, mb, stats, meta=packet.meta)
+                        outbox.submit_tensor(UPSTREAM, grad_in, MessageType.BACKWARD_GRADIENT, device=dev,
+                                             step=step, microbatch=mb, job_id=settings.job_id,
+                                             source_worker=worker, meta=meta)
                     if settings.log_microbatch_events:
                         logger.log("BACKWARD_COMPLETE", step, mb, compute_s=ctx.timings["backward"])
-                    done += 1
-                else:
-                    raise BoundaryError(f"unexpected {mtype.name} from {name}")
+                sm.advance()
 
-                if stage.is_last and mb in pending_act and mb in pending_tgt:
-                    ctx = MicrobatchContext(step, mb)
-                    loss, grad_in = stage.forward_loss(pending_act.pop(mb), pending_tgt.pop(mb), ctx,
-                                                       loss_scale=1.0 / M)
-                    stats.forward_s += ctx.timings["forward"]
-                    stats.backward_s += ctx.timings["backward"]
-                    stats.peak_saved_bytes = max(stats.peak_saved_bytes, ctx.peak_saved_bytes)
-                    loss_val = float(loss)
-                    loss_sum += loss_val
-                    send(upstream, grad_in, MessageType.BACKWARD_GRADIENT, step, mb, stats,
-                         meta={"loss": loss_val})
-                    if settings.log_microbatch_events:
-                        logger.log("BACKWARD_COMPLETE", step, mb, loss=loss_val, compute_s=ctx.timings["backward"])
-                    done += 1
-
+            if not sm.all_complete():
+                raise fail_dump("schedule finished with incomplete microbatches")
             if settings.capture_gradients_at_step == step:
                 result.gradients = stage.named_gradients()
             mem = stage.memory_report()  # gradients present, before zero_grad
-            mem["saved_activations_peak"] = stats.peak_saved_bytes
-            opt_s = stage.optimizer_step()
+            mem["saved_activations_peak"] = peak_saved_bytes
+            mem["saved_microbatches_peak"] = peak_saved_mbs
+            with tl.span("OPTIMIZER_STEP", step):
+                opt_s = stage.optimizer_step()
             stage.zero_grad()
-            step_s = time.perf_counter() - t_step
+            t_step1 = tl.now()
+            step_s = t_step1 - t_step0
+            m = tl.step_metrics(step, (t_step0, t_step1))
+            phase = m["phase_s"]
             mean_loss = loss_sum / M
             dev_mem = dev.memory_stats()
+            bytes_sent = sum(outbox.bytes_sent.values()) - sum(sent0.values())
             record = {
                 "event": "STEP_COMPLETE", "job": settings.job_id, "worker": worker,
-                "stage": stage.stage_index, "backend": dev.backend, "step": step,
-                "step_s": step_s, "forward_s": stats.forward_s, "backward_s": stats.backward_s,
-                "optimizer_s": opt_s, "comm_s": stats.comm_s, "idle_s": stats.idle_s,
-                "bytes_sent": stats.bytes_sent, "bytes_received": stats.bytes_received,
-                "lifecycle": stats.lifecycle,
-                "utilization": (stats.forward_s + stats.backward_s + opt_s) / step_s if step_s else 0.0,
+                "stage": sidx, "backend": dev.backend, "step": step, "schedule": settings.schedule,
+                "async_transport": settings.async_transport,
+                "step_s": step_s, "forward_s": phase.get("FORWARD_COMPUTE", 0.0),
+                "backward_s": phase.get("BACKWARD_COMPUTE", 0.0), "optimizer_s": opt_s,
+                "compute_s": m["compute_s"], "comm_s": m["communication_s"],
+                "communication_s": m["communication_s"], "overlapped_s": m["overlapped_s"],
+                "exposed_communication_s": m["exposed_communication_s"], "overlap_ratio": m["overlap_ratio"],
+                "idle_s": m["idle_s"],
+                "wait_forward_s": phase.get("WAIT_FORWARD", 0.0), "wait_backward_s": phase.get("WAIT_BACKWARD", 0.0),
+                "bytes_sent": bytes_sent, "bytes_received": st["bytes_received"] - bytes_recv0,
+                "lifecycle": {k: v for k, v in phase.items() if not k.startswith("WAIT")},
+                "outbound_queue_peak": max(outbox.peak_depth.values(), default=0),
+                "inbound_queue_peak": inbox.peak_depth if inbox else 0,
+                "peak_inflight_microbatches": sm.peak_inflight,
+                "utilization": m["compute_s"] / step_s if step_s else 0.0,
                 "memory": {**mem, "device_allocated": dev_mem.get("allocated", 0),
                            "device_peak": dev_mem.get("peak_allocated", 0), "device_total": dev_mem.get("total", 0)},
             }
@@ -310,15 +391,18 @@ def run_stage(
             result.step_metrics.append(record)
             if metrics_callback is not None:
                 metrics_callback(record)
+            if not settings.trace:
+                tl.drop_before(t_step1)
             if local_step % settings.log_every == 0 or local_step == settings.steps - 1:
-                fields = {"step_s": step_s, "fwd_s": stats.forward_s, "bwd_s": stats.backward_s,
-                          "comm_s": stats.comm_s, "idle_s": stats.idle_s, "sent_bytes": stats.bytes_sent}
+                fields = {"step_s": step_s, "compute_s": m["compute_s"], "comm_s": m["communication_s"],
+                          "exposed_s": m["exposed_communication_s"], "idle_s": m["idle_s"], "sent_bytes": bytes_sent}
                 if stage.is_first:
                     fields = {"loss": mean_loss, **fields}
                 logger.log("STEP_COMPLETE", step, None, **fields)
+        outbox.flush()
     except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"
-        logger.log("ERROR", None, None, error=result.error)
+        logger.log("ERROR", None, None, error=result.error[:500])
         # Best effort: tell neighbours so they fail fast instead of timing out.
         for link in links.values():
             try:
@@ -326,10 +410,27 @@ def run_stage(
                                               meta={"error": f"{worker}: {result.error}"[:200]}))
             except Exception:
                 pass
+        if isinstance(exc, OutboxError):
+            raise PipelineError(str(exc)) from exc
         raise
     finally:
         if inbox is not None:
             inbox.stop()
+        outbox.close()
     if capture_params:
         result.final_params = stage.named_parameters_cpu()
+    if settings.trace:
+        result.timeline = tl.export()
     return result
+
+
+class _HostAdapter:
+    """Staging for tensors that already live in host memory (targets)."""
+
+    @staticmethod
+    def begin_d2h(tensor: torch.Tensor):
+        t = tensor.detach()
+        return lambda: (t, None)
+
+
+_HOST = _HostAdapter()
