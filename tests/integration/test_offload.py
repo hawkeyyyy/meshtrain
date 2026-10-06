@@ -198,3 +198,56 @@ def test_cuda_static_ooms_but_offload_trains_under_same_cap():
     assert out["static"][0] == "fail" and "out of memory" in out["static"][1].lower(), out["static"]
     assert out["auto_offload"][0] == "ok", out["auto_offload"]
     assert out["auto_offload"][2] <= 256 * 1024**2
+
+
+def _optimizer_state(stage) -> dict:
+    out = {}
+    for n, p in stage.module.named_parameters():
+        for k, v in stage.optimizer.state.get(p, {}).items():
+            if torch.is_tensor(v):
+                out[f"{n}.{k}"] = v.detach().float().cpu().clone()
+    return out
+
+
+def _losses(stage, spec, steps, offset):
+    out = []
+    for i in range(offset, offset + steps):
+        s = PipelineSettings("ckpt", steps=1, batch_size=8, num_microbatches=4, step_offset=i, trace=False,
+                             log_every=10**6)
+        out.append(run_stage(stage, spec, s, upstream=None, downstream=None).losses[0])
+    return out
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("save_policy,load_policy,exact", [
+    (None, ResidencyPolicy(strategy="manual_offload"), True),
+    (ResidencyPolicy(strategy="manual_offload", prefetch_distance=1), None, True),
+    (None, ResidencyPolicy(strategy="manual_offload", optimizer_execution="cpu_offload"), False),
+    (ResidencyPolicy(strategy="manual_offload", optimizer_execution="cpu_offload"), None, False),
+])
+def test_cuda_checkpoint_resume_across_residency(tmp_path, save_policy, load_policy, exact):
+    """static CUDA <-> local-offload CUDA: loss, parameters and AdamW state after resuming."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    ref, spec = build_single_stage(DEFAULT_MODEL, device="cuda")
+    ref_losses = _losses(ref, spec, 4, 0)
+    want_p, want_s = ref.named_parameters_cpu(), _optimizer_state(ref)
+    ref.close()
+    a, spec = build_single_stage(DEFAULT_MODEL, device="cuda", policy=save_policy)
+    first = _losses(a, spec, 2, 0)
+    save_stage_checkpoint(a, tmp_path / "s.pt", step=2)
+    a.close()
+    b, spec = build_single_stage(DEFAULT_MODEL, device="cuda", policy=load_policy)
+    load_stage_checkpoint(b, tmp_path / "s.pt")
+    second = _losses(b, spec, 2, 2)
+    got_p, got_s = b.named_parameters_cpu(), _optimizer_state(b)
+    b.close()
+    assert set(got_s) == set(want_s) and set(got_p) == set(want_p)
+    if exact:   # same GPU AdamW kernels on both sides of the checkpoint
+        assert first + second == ref_losses
+        assert all(torch.equal(want_p[k], got_p[k]) for k in want_p)
+        assert all(torch.equal(want_s[k], got_s[k]) for k in want_s)
+    else:       # one half ran CPU AdamW: kernel rounding only (see module docstring)
+        assert first + second == pytest.approx(ref_losses, abs=1e-5)
+        assert max(float((want_p[k] - got_p[k]).abs().max()) for k in want_p) < 2e-4
+        assert max(float((want_s[k] - got_s[k]).abs().max()) for k in want_s) < 1e-4
