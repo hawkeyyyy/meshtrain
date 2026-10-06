@@ -1,0 +1,324 @@
+{
+  "meta": {
+    "kind": "capacity",
+    "budget": 8589934592,
+    "hidden": 1280,
+    "blocks": [
+      16,
+      20,
+      24,
+      28
+    ],
+    "summary": {
+      "static": {
+        "P_max": 317545984,
+        "steps_per_s_at_P_max": 2.7331676218049785,
+        "blocks_at_P_max": 16,
+        "first_failure": {
+          "parameters": 396255744,
+          "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. 8.00 GiB allowed; Of the allocated memory 6.62 GiB is allocated by PyTorch, and 173.85 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting"
+        }
+      },
+      "local-offload": {
+        "P_max": 317545984,
+        "steps_per_s_at_P_max": 0.30491371291103303,
+        "blocks_at_P_max": 16,
+        "first_failure": {
+          "parameters": 396255744,
+          "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 4.43 GiB is free. 8.00 GiB allowed; Of the allocated memory 2.37 GiB is allocated by PyTorch, and 51.64 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting"
+        },
+        "capacity_gain": 1.0,
+        "slowdown_at_static_P_max": 8.963741235876968
+      },
+      "auto-offload-gpu-optimizer": {
+        "P_max": 317545984,
+        "steps_per_s_at_P_max": 3.2696336272334348,
+        "blocks_at_P_max": 16,
+        "first_failure": {
+          "parameters": 396255744,
+          "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 769.41 MiB is free. 8.00 GiB allowed; Of the allocated memory 5.53 GiB is allocated by PyTorch, and 163.25 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try sett"
+        },
+        "capacity_gain": 1.0,
+        "slowdown_at_static_P_max": 0.8359247345145575
+      }
+    },
+    "environment": {
+      "host": "hawkey",
+      "os": "Windows 11",
+      "torch": "2.6.0+cu124",
+      "ram_total": 16555880448,
+      "date": "2026-10-06T12:22:29",
+      "gpu": "NVIDIA GeForce RTX 4070 Laptop GPU",
+      "gpu_total": 8585216000
+    }
+  },
+  "trials": [
+    {
+      "strategy": "static",
+      "policy": {
+        "strategy": "static"
+      },
+      "model": {
+        "type": "tiny_transformer",
+        "layers": 16,
+        "hidden_size": 1280,
+        "heads": 8,
+        "vocab_size": 1024,
+        "seq_len": 64
+      },
+      "device": "cuda",
+      "budget": 8589934592,
+      "batch": 8,
+      "microbatches": 4,
+      "steps": 3,
+      "parameters": 317545984,
+      "host_ram_needed": 1270183936,
+      "host_ram_available": 5471875072,
+      "build_s": 2.063436900032684,
+      "ok": true,
+      "loss_first": 7.1570751667022705,
+      "loss_last": 7.170265078544617,
+      "losses": [
+        7.1570751667022705,
+        7.219039678573608,
+        7.170265078544617
+      ],
+      "step_s": 0.36587584018707275,
+      "steps_per_s": 2.7331676218049785,
+      "samples_per_s": 21.865340974439828,
+      "compute_s": 0.35829031467437744,
+      "optimizer_s": 0.12681460002204403,
+      "memory_transfer_s": 0.0,
+      "exposed_memory_transfer_s": 0.0,
+      "memory_overlapped_s": 0.0,
+      "accelerator_peak_allocated": 6741883392,
+      "accelerator_peak_reserved": 6889144320,
+      "ledger_accelerator_peak": 5080735744,
+      "ram_resident": 0,
+      "pinned_bytes": 0,
+      "process_rss_peak": 2301100032,
+      "H2D_bytes_per_step": 0.0,
+      "D2H_bytes_per_step": 0.0,
+      "H2D_ms_per_step": 0.0,
+      "D2H_ms_per_step": 0.0,
+      "prefetch_stall_ms": 0.0,
+      "sync_load_ms": 0.0,
+      "tensor_cache_hit_ratio": null,
+      "evictions_per_step": 0.0,
+      "budget_violations": 0.0,
+      "within_budget": true,
+      "wall_s": 6.131630182266235,
+      "blocks": 16
+    },
+    {
+      "strategy": "static",
+      "policy": {
+        "strategy": "static"
+      },
+      "model": {
+        "type": "tiny_transformer",
+        "layers": 20,
+        "hidden_size": 1280,
+        "heads": 8,
+        "vocab_size": 1024,
+        "seq_len": 64
+      },
+      "device": "cuda",
+      "budget": 8589934592,
+      "batch": 8,
+      "microbatches": 4,
+      "steps": 3,
+      "parameters": 396255744,
+      "host_ram_needed": 1585022976,
+      "host_ram_available": 5388886016,
+      "build_s": 2.341916300007142,
+      "ok": false,
+      "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. 8.00 GiB allowed; Of the allocated memory 6.62 GiB is allocated by PyTorch, and 173.85 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting",
+      "oom": true,
+      "wall_s": 6.729357719421387,
+      "blocks": 20
+    },
+    {
+      "strategy": "local-offload",
+      "policy": {
+        "strategy": "manual_offload",
+        "prefetch_distance": 0
+      },
+      "model": {
+        "type": "tiny_transformer",
+        "layers": 16,
+        "hidden_size": 1280,
+        "heads": 8,
+        "vocab_size": 1024,
+        "seq_len": 64
+      },
+      "device": "cuda",
+      "budget": 8589934592,
+      "batch": 8,
+      "microbatches": 4,
+      "steps": 3,
+      "parameters": 317545984,
+      "host_ram_needed": 3810551808,
+      "host_ram_available": 5061054464,
+      "build_s": 2.126144300098531,
+      "hot_layers": 0,
+      "cold_layers": 18,
+      "ok": true,
+      "loss_first": 7.1570751667022705,
+      "loss_last": 7.170265078544617,
+      "losses": [
+        7.1570751667022705,
+        7.219039678573608,
+        7.170265078544617
+      ],
+      "step_s": 3.279616355895996,
+      "steps_per_s": 0.30491371291103303,
+      "samples_per_s": 2.4393097032882642,
+      "compute_s": 0.4115283489227295,
+      "optimizer_s": 0.6684415499912575,
+      "memory_transfer_s": 2.858088970184326,
+      "exposed_memory_transfer_s": 2.858088970184326,
+      "memory_overlapped_s": 0.0,
+      "accelerator_peak_allocated": 2965391872,
+      "accelerator_peak_reserved": 3185573888,
+      "ledger_accelerator_peak": 2776497152,
+      "ram_resident": 2540367872,
+      "pinned_bytes": 2540367872,
+      "process_rss_peak": 5880696832,
+      "H2D_bytes_per_step": 12679557120.0,
+      "D2H_bytes_per_step": 6350919680.0,
+      "H2D_ms_per_step": 1376.104400679469,
+      "D2H_ms_per_step": 1399.5658159255981,
+      "prefetch_stall_ms": 0.0,
+      "sync_load_ms": 1392.2289609909058,
+      "tensor_cache_hit_ratio": 0.742671009771987,
+      "evictions_per_step": 158.0,
+      "budget_violations": 0.0,
+      "within_budget": true,
+      "wall_s": 15.853833436965942,
+      "blocks": 16
+    },
+    {
+      "strategy": "local-offload",
+      "policy": {
+        "strategy": "manual_offload",
+        "prefetch_distance": 0
+      },
+      "model": {
+        "type": "tiny_transformer",
+        "layers": 20,
+        "hidden_size": 1280,
+        "heads": 8,
+        "vocab_size": 1024,
+        "seq_len": 64
+      },
+      "device": "cuda",
+      "budget": 8589934592,
+      "batch": 8,
+      "microbatches": 4,
+      "steps": 3,
+      "parameters": 396255744,
+      "host_ram_needed": 4755068928,
+      "host_ram_available": 5936267264,
+      "build_s": 2.825962799950503,
+      "hot_layers": 0,
+      "cold_layers": 22,
+      "ok": false,
+      "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 4.43 GiB is free. 8.00 GiB allowed; Of the allocated memory 2.37 GiB is allocated by PyTorch, and 51.64 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting",
+      "oom": true,
+      "wall_s": 11.274909496307373,
+      "blocks": 20
+    },
+    {
+      "strategy": "auto-offload-gpu-optimizer",
+      "policy": {
+        "strategy": "auto_offload",
+        "prefetch_distance": 1
+      },
+      "model": {
+        "type": "tiny_transformer",
+        "layers": 16,
+        "hidden_size": 1280,
+        "heads": 8,
+        "vocab_size": 1024,
+        "seq_len": 64
+      },
+      "device": "cuda",
+      "budget": 8589934592,
+      "batch": 8,
+      "microbatches": 4,
+      "steps": 3,
+      "parameters": 317545984,
+      "host_ram_needed": 3810551808,
+      "host_ram_available": 7071580160,
+      "build_s": 2.4790879000211135,
+      "hot_layers": 18,
+      "cold_layers": 0,
+      "ok": true,
+      "loss_first": 7.1570751667022705,
+      "loss_last": 7.170265078544617,
+      "losses": [
+        7.1570751667022705,
+        7.219039678573608,
+        7.170265078544617
+      ],
+      "step_s": 0.30584466457366943,
+      "steps_per_s": 3.2696336272334348,
+      "samples_per_s": 26.157069017867478,
+      "compute_s": 0.29876983165740967,
+      "optimizer_s": 0.10300730005837977,
+      "memory_transfer_s": 0.0,
+      "exposed_memory_transfer_s": 0.0,
+      "memory_overlapped_s": 0.0,
+      "accelerator_peak_allocated": 6540188160,
+      "accelerator_peak_reserved": 6777995264,
+      "ledger_accelerator_peak": 6350919680,
+      "ram_resident": 0,
+      "pinned_bytes": 0,
+      "process_rss_peak": 2266693632,
+      "H2D_bytes_per_step": 0.0,
+      "D2H_bytes_per_step": 0.0,
+      "H2D_ms_per_step": 0.0,
+      "D2H_ms_per_step": 0.0,
+      "prefetch_stall_ms": 0.0,
+      "sync_load_ms": 0.0,
+      "tensor_cache_hit_ratio": 1.0,
+      "evictions_per_step": 0.0,
+      "budget_violations": 0.0,
+      "within_budget": true,
+      "wall_s": 6.8823418617248535,
+      "blocks": 16
+    },
+    {
+      "strategy": "auto-offload-gpu-optimizer",
+      "policy": {
+        "strategy": "auto_offload",
+        "prefetch_distance": 1
+      },
+      "model": {
+        "type": "tiny_transformer",
+        "layers": 20,
+        "hidden_size": 1280,
+        "heads": 8,
+        "vocab_size": 1024,
+        "seq_len": 64
+      },
+      "device": "cuda",
+      "budget": 8589934592,
+      "batch": 8,
+      "microbatches": 4,
+      "steps": 3,
+      "parameters": 396255744,
+      "host_ram_needed": 4755068928,
+      "host_ram_available": 6788624384,
+      "build_s": 2.7735192000400275,
+      "hot_layers": 18,
+      "cold_layers": 4,
+      "ok": false,
+      "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 769.41 MiB is free. 8.00 GiB allowed; Of the allocated memory 5.53 GiB is allocated by PyTorch, and 163.25 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try sett",
+      "oom": true,
+      "wall_s": 7.228058815002441,
+      "blocks": 20
+    }
+  ]
+}

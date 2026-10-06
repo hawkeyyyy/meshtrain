@@ -468,9 +468,17 @@ def _train_local(args) -> int:
     settings = cfg.pipeline_settings(run_id)
     transport = "tcp" if cfg.network.tensor_transport == "tcp" else "pipe"
     os.environ.pop("MESHTRAIN_QUIET", None)
+    policy = cfg.residency_policy()
+    budget = cfg.memory.budget_bytes(_device_total(stages[0].device), stages[0].device)
+    if policy.active or budget is not None:
+        print(f"memory: strategy {policy.strategy}, optimizer {policy.optimizer_execution}, "
+              f"budget {budget / 1024**3:.2f} GB per stage" if budget else
+              f"memory: strategy {policy.strategy}, optimizer {policy.optimizer_execution}", flush=True)
     results = run_local_pipeline(cfg.model.spec_kwargs(), stages, settings, seed=cfg.job.seed,
                                  optimizer=cfg.training.optimizer, lr=cfg.training.learning_rate,
-                                 transport=transport, capture_params=True, torch_threads=args.threads)
+                                 transport=transport, capture_params=True, torch_threads=args.threads,
+                                 residency=policy if (policy.active or budget is not None) else None,
+                                 accelerator_budget=budget)
     writer = MetricsWriter(os.path.join(run_dir, "metrics.jsonl"))
     for r in results:
         for rec in r.step_metrics:
@@ -848,7 +856,8 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--cluster", help="JSON from `cluster benchmark --output` (else a documented example cluster)")
     e.add_argument("--steps", type=int, default=5)
     e.add_argument("--memory-strategy", action="append", default=[],
-                   choices=["static", "local-offload", "optimizer-offload", "local-offload-prefetch", "auto-offload"],
+                   choices=["static", "local-offload", "optimizer-offload", "local-offload-prefetch", "auto-offload",
+                            "auto-offload-gpu-optimizer"],
                    help="capacity: V2 single-device capacity search per strategy (repeatable)")
     e.add_argument("--budget-mb", type=float, help="capacity --memory-strategy: accelerator budget (hard cap)")
     e.add_argument("--blocks", help="capacity --memory-strategy: comma list of transformer block counts")

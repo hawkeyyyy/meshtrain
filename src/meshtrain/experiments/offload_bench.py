@@ -37,9 +37,11 @@ STRATEGIES = {
     "optimizer-offload": dict(strategy="manual_offload", prefetch_distance=0, optimizer_execution="cpu_offload"),
     "local-offload-prefetch": dict(strategy="manual_offload", prefetch_distance=1, optimizer_execution="cpu_offload"),
     "auto-offload": dict(strategy="auto_offload", prefetch_distance=1, optimizer_execution="cpu_offload"),
+    # auto residency with AdamW kept on the device: ~8 B/param of host RAM instead of ~16
+    "auto-offload-gpu-optimizer": dict(strategy="auto_offload", prefetch_distance=1),
 }
 LETTER = {"static": "A", "local-offload": "B", "optimizer-offload": "C", "local-offload-prefetch": "D",
-          "auto-offload": "auto"}
+          "auto-offload": "auto", "auto-offload-gpu-optimizer": "auto-g"}
 
 
 def capacity_model(blocks: int, hidden: int = 1280) -> dict:
@@ -66,7 +68,19 @@ def _trial(model_cfg: dict, strategy: str, device: str, budget: int | None, step
     try:
         from meshtrain.models import build_model_spec
 
-        out["parameters"] = build_model_spec(model_cfg).parameter_count()
+        out["parameters"] = n = build_model_spec(model_cfg).parameter_count()
+        # Host RAM guard: never push the machine into the pagefile (on Windows, exhausted host
+        # memory surfaces as spurious CUDA OOMs). Bytes per parameter in RAM: model built on the
+        # CPU (4) + masters/gradients (8) + AdamW state on the CPU optimizer (8), plus process
+        # overhead: measured 396M local-offload peaks at 7.0 GB RSS pinned, 4.4 GB pageable.
+        per_param = 4 + (8 if policy.strategy != "static" or policy.optimizer_execution == "cpu_offload" else 0) \
+            + (8 if policy.optimizer_execution == "cpu_offload" else 0)
+        overhead = 1.5 * GB if policy.pin_host_memory and device == "cuda" else 0.5 * GB
+        need, avail = n * per_param + int(overhead), psutil.virtual_memory().available
+        out["host_ram_needed"], out["host_ram_available"] = need, avail
+        if need > 0.95 * avail:
+            raise MemoryError(f"insufficient host RAM: needs ~{need / GB:.2f} GB, {avail / GB:.2f} GB available "
+                              f"(trial skipped to avoid paging)")
         t_build = time.perf_counter()
         stage, spec = build_single_stage(model_cfg, device=device, policy=policy, budget_bytes=budget,
                                          optimizer="adamw", lr=3e-4, microbatch_size=micro)
