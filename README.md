@@ -71,9 +71,32 @@ accelerator only while needed. Design: [docs/v2-architecture.md](docs/v2-archite
 | 11. Automatic residency planner | **Verified**: benefit/byte heuristic within the budget; cluster planner uses it |
 | 12. Capacity vs V1.5 | **Measured on RTX 4070 Laptop**: 2 GiB cap 81.4M → 238.8M (2.93×); full 8 GiB GPU 317.5M → 396.3M trains (static OOMs) |
 | 13. Documentation and traces | Done; residency spans in Perfetto timelines |
-| 14. Remote RAM | Not started (interfaces raise `NotImplementedError`) |
+| 14. Remote RAM | V2.5, below |
 
 `memory.strategy: static` (default) is the unchanged V1.5 path.
+
+## Status (V2.5: remote RAM as a backing tier)
+
+Another machine's RAM can hold layers' master weights and AdamW state. Layers are fetched over the network,
+staged in local RAM and copied to the GPU before they compute, and every update is written back with a
+version check. GPU kernels still read only local VRAM. Design: [docs/v2.5-remote-memory.md](docs/v2.5-remote-memory.md).
+Results: [docs/v2.5-results.md](docs/v2.5-results.md).
+
+Measured on an RTX 4070 laptop + a CPU-only Fedora machine over 154 Mbit/s Wi-Fi, with the same 1 GiB GPU
+and 1.5 GiB local RAM budgets: largest trainable model **42.1M (static) → 81.4M (local RAM offload) →
+160.1M (+3.5 GiB of the Fedora machine's RAM)**. Losses are bit-identical to a run without remote memory.
+Each step took 179 s at 160.1M (3.8 GB over the network per step). This is a capacity tool, not a
+throughput tool, on a commodity link.
+
+```sh
+# on the RAM machine
+meshtrain join CODE --remote-ram-budget-mb 8192        # or: meshtrain tensor-server --budget-mb 8192
+# on the GPU machine
+meshtrain remote status --probe
+meshtrain experiment capacity --memory-strategy static --memory-strategy local-offload-reuse     --memory-strategy remote-offload --budget-mb 1024 --local-ram-budget-mb 1536     --remote-ram-budget-mb 3584 --remote-worker fedora
+```
+
+Trusted private networks only: the cluster token authenticates, but there is no encryption.
 
 ## Install
 

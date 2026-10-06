@@ -36,9 +36,10 @@ COMM_WORK = tuple(c for c in TRANSFER if c != "QUEUE_WAIT")
 # V2 tensor residency (RAM <-> accelerator, runtime/offload.py). Kept apart from
 # network communication. Blocking categories happen on the compute thread *inside*
 # forward/backward/optimizer spans and are subtracted from compute time.
-MEMORY_ASYNC = ("TENSOR_PREFETCH",)
-MEMORY_BLOCKING = ("TENSOR_LOAD", "PREFETCH_STALL", "TENSOR_WRITEBACK", "TENSOR_EVICT", "OPTIMIZER_OFFLOAD")
-MEMORY_STATE = ("TENSOR_ACCELERATOR_RESIDENT", "TENSOR_RAM_RESIDENT")
+MEMORY_ASYNC = ("TENSOR_PREFETCH", "REMOTE_PREFETCH", "REMOTE_PUT")
+MEMORY_BLOCKING = ("TENSOR_LOAD", "PREFETCH_STALL", "TENSOR_WRITEBACK", "TENSOR_EVICT", "OPTIMIZER_OFFLOAD",
+                   "REMOTE_GET", "REMOTE_FETCH_STALL")
+MEMORY_STATE = ("TENSOR_ACCELERATOR_RESIDENT", "TENSOR_RAM_RESIDENT", "REMOTE_RESIDENCY")
 
 
 @dataclass
