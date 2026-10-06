@@ -19,7 +19,7 @@ execution across consumer accelerators.* V1 is the minimal, correct foundation; 
 | 1. Local CPU prototype: stages in separate processes, gradient equivalence | **Verified on CPU.** Gradients match single-process PyTorch: MLP error 0, Transformer ≤ 3e-7 relative |
 | 2. TCP transport | **Verified over loopback and a physical LAN**: activations and gradients transmitted between two GPU machines |
 | 3. CUDA → CUDA | **Measured on RTX 4070 Laptop → GTX 1050 Ti**: 396M and 475M models completed five steps across both GPUs; five-step loss curves match laptop-only runs within 3.6e-7 absolute |
-| 4. CUDA → CUDA → MPS | Implemented (`MPSDeviceAdapter`, MPS-marked tests). **Not run: no CUDA/MPS hardware was available** |
+| 4. CUDA → CUDA → MPS | Implemented (`MPSDeviceAdapter`, MPS-marked tests). **Not run as specified** (needs two CUDA machines); a CUDA → MPS → CPU pipeline was measured, see V1.5 milestone 9 |
 | 5. Microbatch (GPipe) pipeline | **Verified on CPU.** Microbatch routing and accumulation equal full-batch gradients |
 | 6. Hardware / network profiler | **Verified on CPU workers**: compute benchmark, directional latency/bandwidth matrix |
 | 7. Static partition planner | **Verified** (unit tests + emulated experiment): equal / compute / auto (memory + compute + network) |
@@ -43,7 +43,7 @@ Placement is still static: each stage stays on one worker for the whole job. See
 | 6. 1F1B on CUDA | Implemented; CUDA-marked tests **not run (no GPU)** |
 | 7. Compute/communication overlap | **Measured on CPU** with an emulated 100 Mbit/s link: 864 → 501 ms/step |
 | 8. Memory estimation + startup OOM replanning | **Verified on CPU** with emulated device memory; estimator matches the earlier RTX 4070 + 1050 Ti outcomes (396M fits, 475M rejected). It is conservative: a later run trained 475M across both GPUs, a split this estimator still rejects |
-| 9. MPS adapter, CUDA→CUDA→MPS | Implemented with capability probes; MPS tests **not run (no Mac)** |
+| 9. MPS adapter, CUDA→CUDA→MPS | **Measured CUDA → MPS → CPU over a physical LAN** (RTX 4070 Laptop → Apple Silicon MacBook Air → Fedora x86_64 CPU): 100 steps, max relative loss deviation 1.05e-7 vs CPU single-process. MPS-marked pytest tests not yet run |
 | 10. Topology-aware planner | **Verified** (unit tests) |
 | 11. Timeline tracing, benchmark reports | **Verified on CPU**: Chrome traces, overlap/idle breakdown, prediction accuracy |
 | 12. TensorStore / MemoryTier interfaces | Interfaces + stable tensor IDs only; no eviction or paging (that is V2) |

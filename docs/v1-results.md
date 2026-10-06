@@ -308,3 +308,21 @@ then `meshtrain results record runs/<job-id> --section experiment2`._
 _not yet run — no physical CUDA/MPS hardware was available. Run `meshtrain train configs/cuda_cuda_mps.yaml`,
 then `meshtrain results record runs/<job-id> --section experiment3`._
 <!-- END:experiment3 -->
+
+<!-- BEGIN:cuda-cpu-mps-lan -->
+Run `cuda-cpu-mps-20261006-113414-5d1d` — hardware: hawkey (cuda, NVIDIA GeForce RTX 4070 Laptop GPU) -> Sohans-MacBook-Air.local (mps, Apple arm64 (MPS)) -> fedora (cpu, x86_64)
+
+Model: tiny_transformer 40.0M params (14 layers); batch 16, 4 microbatches, adamw.
+
+| steps | loss first -> last | ms/step | steps/s | samples/s | MB/step on network | max rel. loss deviation vs CPU single-process (first 100 steps) |
+|---|---|---|---|---|---|---|
+| 100 | 7.7928 -> 2.7797 | 1427.2 | 0.70 | 11.6 | 16.32 | 1.05e-07 |
+
+_device peak = torch allocator peak (CUDA), driver allocation (MPS), process RSS (CPU)._
+
+| stage | worker | backend | layers | planned GB (need / usable) | device peak GB | fwd ms | bwd ms | comm ms | idle ms | MB sent/step |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | hawkey | cuda | 0-0 | 0.03 / 6.87 | 0.06 | 9.0 | 12.4 | 633.4 | 772.3 | 4.21 |
+| 1 | Sohans-MacBook-Air.local | mps | 1-10 | 1.18 / 4.58 | 1.09 | 119.2 | 220.7 | 992.0 | 226.0 | 7.91 |
+| 2 | fedora | cpu | 11-13 | 0.24 / 7.84 | 1.48 | 223.8 | 343.1 | 452.6 | 468.9 | 4.20 |
+<!-- END:cuda-cpu-mps-lan -->

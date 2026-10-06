@@ -1,0 +1,30 @@
+# Scenario: one CUDA machine + one CPU-only machine, medium Transformer over a physical LAN.
+job:
+  name: cuda-cpu-medium
+
+model:
+  type: tiny_transformer
+  layers: 16
+  hidden_size: 768
+  heads: 12
+  vocab_size: 4096
+  seq_len: 128
+
+training:
+  batch_size: 32
+  microbatch_size: 4
+  learning_rate: 0.0003
+  optimizer: adamw
+  steps: 200
+  log_every: 20
+
+placement:
+  strategy: auto
+  num_stages: 2
+
+workers:
+  allow: [cuda, cpu]
+
+network:
+  tensor_transport: tcp
+  timeout_s: 120

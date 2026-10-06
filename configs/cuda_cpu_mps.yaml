@@ -1,0 +1,30 @@
+# Scenario: CUDA + CPU-only + Apple MPS machines, Transformer over a physical LAN (3 stages).
+job:
+  name: cuda-cpu-mps
+
+model:
+  type: tiny_transformer
+  layers: 12
+  hidden_size: 512
+  heads: 8
+  vocab_size: 2048
+  seq_len: 128
+
+training:
+  batch_size: 16
+  microbatch_size: 4
+  learning_rate: 0.0003
+  optimizer: adamw
+  steps: 100
+  log_every: 10
+
+placement:
+  strategy: auto
+  num_stages: 3
+
+workers:
+  allow: [cuda, cpu, mps]
+
+network:
+  tensor_transport: tcp
+  timeout_s: 120

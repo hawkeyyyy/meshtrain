@@ -53,7 +53,9 @@ meshtrain experiment device-correctness --devices cpu,cpu,mps
 These compare loss, first-step gradients, per-parameter gradient norms, first-update parameter deltas and output
 logits against a single-process CPU reference, with tolerance 5e-3 relative. MPS kernels and reduction orders
 differ from CPU, so the check is not bitwise. The same checks are pytest tests marked `@pytest.mark.mps`. They
-skip on machines without MPS and **have not been run yet**: no Mac was available during development.
+skip on machines without MPS and **have not been run yet**. A three-machine CUDA → MPS → CPU run over a
+physical LAN (Apple Silicon MacBook Air) matched a CPU single-process loss curve within 1.05e-7 relative over
+100 steps; see the `cuda-cpu-mps-lan` section of [v1-results.md](v1-results.md).
 
 For the target cluster (RTX → RTX → M2) run `meshtrain train configs/cuda_cuda_mps.yaml`, then
 `meshtrain results record runs/<job-id> --section experiment3`. Recording replays the loss curve on CPU and
