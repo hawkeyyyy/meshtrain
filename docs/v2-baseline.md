@@ -50,7 +50,8 @@ never run.
 
 ## Throughput and peak memory (single device, one stage, no network)
 
-Reproduce with `python scripts/v15_baseline.py throughput --device cuda`.
+Reproduce with `python scripts/v15_baseline.py throughput --device cuda`. Raw output:
+[data/v2/v15-baseline/](data/v2/v15-baseline/).
 AdamW, batch 16, 4 microbatches, 12 steps (first excluded), uncapped allocator.
 
 | Model | Parameters | ms/step | samples/s | Peak allocated |

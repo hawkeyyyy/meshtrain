@@ -38,18 +38,42 @@ Placement is still static: each stage stays on one worker for the whole job. See
 | 1. V1 audit and baseline | Done: [docs/v1.5-baseline.md](docs/v1.5-baseline.md) |
 | 2. Event/state-machine pipeline (GPipe preserved) | **Verified on CPU** (gradient equivalence) |
 | 3. Async transport with bounded queues | **Verified on CPU/loopback**, including back-pressure and a 4-stage × 32-microbatch stress test |
-| 4. Buffer reuse, pinned CUDA staging | Buffer reuse **verified on CPU**; pinned/stream path implemented, CUDA tests **not run (no GPU)** |
+| 4. Buffer reuse, pinned CUDA staging | Buffer reuse **verified on CPU**; pinned/stream path: CUDA-marked tests **pass on an RTX 4070 Laptop** ([v2-baseline](docs/v2-baseline.md)) |
 | 5. 1F1B on CPU | **Verified**: gradients equal GPipe and single-process; stage-0 activations 37.9 → 14.2 MB |
-| 6. 1F1B on CUDA | Implemented; CUDA-marked tests **not run (no GPU)** |
+| 6. 1F1B on CUDA | CUDA-marked tests **pass on an RTX 4070 Laptop** ([v2-baseline](docs/v2-baseline.md)) |
 | 7. Compute/communication overlap | **Measured on CPU** with an emulated 100 Mbit/s link: 864 → 501 ms/step |
 | 8. Memory estimation + startup OOM replanning | **Verified on CPU** with emulated device memory; estimator matches the earlier RTX 4070 + 1050 Ti outcomes (396M fits, 475M rejected). It is conservative: a later run trained 475M across both GPUs, a split this estimator still rejects |
 | 9. MPS adapter, CUDA→CUDA→MPS | **Measured CUDA → MPS → CPU over a physical LAN** (RTX 4070 Laptop → Apple Silicon MacBook Air → Fedora x86_64 CPU): 100 steps, max relative loss deviation 1.05e-7 vs CPU single-process. MPS-marked pytest tests not yet run |
 | 10. Topology-aware planner | **Verified** (unit tests) |
 | 11. Timeline tracing, benchmark reports | **Verified on CPU**: Chrome traces, overlap/idle breakdown, prediction accuracy |
-| 12. TensorStore / MemoryTier interfaces | Interfaces + stable tensor IDs only; no eviction or paging (that is V2) |
+| 12. TensorStore / MemoryTier interfaces | Interfaces + stable tensor IDs (implemented in V2, below) |
 
 Defaults changed in V1.5: `pipeline.schedule: 1f1b`, `transport.async: true`, `placement.strategy:
 topology_aware`. Set `schedule: gpipe` and `async: false` to get V1 behaviour.
+
+## Status (V2: tensor residency, local-memory phase)
+
+V2 separates **where a layer computes** (unchanged from V1.5) from **where its state lives**. Offloaded
+layers keep their weights, gradients and (optionally) AdamW state in host RAM and are loaded onto the
+accelerator only while needed. Design: [docs/v2-architecture.md](docs/v2-architecture.md). Baseline:
+[docs/v2-baseline.md](docs/v2-baseline.md). Measurements: [docs/v2-results.md](docs/v2-results.md).
+
+| Milestone | Status |
+|---|---|
+| 1. Freeze and benchmark V1.5 | Done: tag `v1.5-stable`, 245 passed / 7 skipped |
+| 2. TensorStore metadata | **Verified**: stable ids, roles, authoritative/cached tiers, dirty, version, per-tier bytes |
+| 3. Artificial accelerator budgets | **Verified on CUDA**: ledger enforcement + hard allocator cap (`memory.accelerator_budget*`) |
+| 4–5. Local-RAM parameter offload, CPU and CUDA | **Verified**: bit-exact vs static on CPU and CUDA (accelerator optimizer) |
+| 6. Multi-step optimizer correctness | **Verified** per step (params, grads, logits); CPU AdamW on CUDA within Adam rounding |
+| 7. Eviction and writeback | **Verified**: after_use / after_backward, LRU under pressure, dirty writeback |
+| 8–9. Prefetch, overlap with compute | **Measured on RTX 4070 Laptop**: hit ratio 0.73 → 0.98; transfers mostly exposed (PCIe-bound) |
+| 10. Optimizer-state offload | **Verified**: AdamW state + masters in RAM, CPU step |
+| 11. Automatic residency planner | **Verified**: benefit/byte heuristic within the budget; cluster planner uses it |
+| 12. Capacity vs V1.5 | **Measured on RTX 4070 Laptop**: 2 GiB cap 81.4M → 238.8M (2.93×); full 8 GiB GPU 317.5M → 396.3M trains (static OOMs) |
+| 13. Documentation and traces | Done; residency spans in Perfetto timelines |
+| 14. Remote RAM | Not started (interfaces raise `NotImplementedError`) |
+
+`memory.strategy: static` (default) is the unchanged V1.5 path.
 
 ## Install
 
@@ -212,7 +236,13 @@ network:   {tensor_transport: tcp, timeout_s: 120}
 pipeline:  {schedule: 1f1b, max_inflight_microbatches: null}   # 1f1b | gpipe
 transport: {async: true, pinned_memory: true, buffer_pool: true}
 memory:    {safety_factor: 0.85, backend_safety_factor: {mps: 0.80}, max_replans: 2}
+# V2 (optional): keep layer state in RAM and load it onto the GPU only when needed
+# memory:  {strategy: auto_offload, accelerator_budget: 6GB, optimizer_offload: true, prefetch_distance: 1}
 ```
+
+V2 commands: `meshtrain memory plan CONFIG` (which layers stay on the GPU), `meshtrain tensors list CONFIG`,
+`meshtrain memory status`, `meshtrain benchmark offload`, `meshtrain experiment offload-correctness`,
+`meshtrain experiment capacity --memory-strategy static --memory-strategy auto-offload --budget-mb 2048`.
 
 Memory settings are explained in [docs/memory-accounting.md](docs/memory-accounting.md), schedules in
 [docs/pipeline-scheduling.md](docs/pipeline-scheduling.md), MPS in [docs/mps.md](docs/mps.md).
@@ -250,10 +280,11 @@ src/meshtrain/
                 scheduler.py outbox.py buffers.py timeline.py      V1.5: schedules, async sends, buffers, traces
                 memory_check.py trace_report.py tensor_store.py
                 tensor_packet.py serialization.py local.py
+                offload.py checkpoint.py                           V2: residency manager, checkpoints
   networking/   protocol.py transport.py tcp.py control.py         data/control plane I/O
                 emulation.py                                       bandwidth/latency emulation (experiments)
   profiler/     hardware.py benchmark.py network.py
-  planner/      graph.py partition.py cost.py memory.py
+  planner/      graph.py partition.py cost.py memory.py residency.py
   models/       mlp_test.py tiny_transformer.py
   experiments/  correctness, placement, capacity, transformer, record, emulation
   cli.py config.py telemetry.py summary.py future.py
