@@ -50,7 +50,19 @@ def test_start_prints_join_code_and_join_works(tmp_path):
         # the joining machine remembered the cluster
         assert token in (tmp_path / "b" / "cluster.json").read_text()
     finally:
+        import psutil
+
+        # `start` runs the coordinator as a child process; on Windows terminate() does not reach it.
         for p in procs[::-1]:
+            try:
+                children = psutil.Process(p.pid).children(recursive=True)
+            except psutil.NoSuchProcess:
+                children = []
             p.terminate()
+            for c in children:
+                try:
+                    c.kill()
+                except psutil.NoSuchProcess:
+                    pass
         for p in procs:
             p.wait(15)
