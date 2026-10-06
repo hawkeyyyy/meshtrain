@@ -282,9 +282,40 @@ def cmd_dashboard(args) -> int:
     return 0
 
 
+def cmd_benchmark_offload(args) -> int:
+    from meshtrain.experiments import offload_bench as ob
+
+    device = args.device or _default_device()
+    if args.config:
+        from meshtrain.config import load_config
+
+        cfg = load_config(args.config)
+        model = cfg.model.spec_kwargs()
+        batch, micro = cfg.training.batch_size, cfg.training.batch_size // cfg.training.num_microbatches
+    else:
+        model, batch, micro = ob.capacity_model(args.blocks, args.hidden), args.batch_size, args.batch_size // args.microbatches
+    budget = int(args.budget_mb * 1024**2) if args.budget_mb else None
+    print(heading("Offload benchmark", f"{device}, budget {args.budget_mb or 'none'} MB, {model}"), flush=True)
+    if args.sweep == "budget":
+        budgets = [int(float(x) * 1024**2) for x in args.budgets.split(",")]
+        rows, d = ob.run_budget_sweep(model, budgets, device=device, steps=args.steps, batch=batch, micro=micro)
+    elif args.sweep == "prefetch":
+        rows, d = ob.run_prefetch_sweep(model, [int(x) for x in args.distances.split(",")], device=device,
+                                        budget=budget, steps=args.steps, batch=batch, micro=micro)
+    else:
+        strategies = args.strategies.split(",") if args.strategies else None
+        rows, d = ob.run_offload_benchmark(model, device=device, budget=budget, steps=args.steps, batch=batch,
+                                           micro=micro, strategies=strategies)
+    print(f"\nresults: {d}/results.json, {d}/results.csv")
+    return 0 if all(r.get("ok") or r.get("strategy") == "static" for r in rows) else 1
+
+
 def cmd_benchmark(args) -> int:
     if args.what == "cluster":
         return cmd_cluster_benchmark(args)
+    if args.what == "offload":
+        os.environ.setdefault("MESHTRAIN_QUIET", "1")
+        return cmd_benchmark_offload(args)
     os.environ.setdefault("MESHTRAIN_QUIET", "1")
     from meshtrain.experiments import pipeline_bench
 
@@ -477,6 +508,25 @@ def cmd_experiment(args) -> int:
         from meshtrain.experiments.placement import run_experiment4
 
         print(run_experiment4(cluster_file=args.cluster))
+    elif args.name == "capacity" and args.memory_strategy:
+        from meshtrain.experiments import offload_bench as ob
+        from meshtrain.experiments.results_doc import update_section
+
+        device = args.device or _default_device()
+        budget = int(args.budget_mb * 1024**2) if args.budget_mb else None
+        blocks = [int(x) for x in args.blocks.split(",")] if args.blocks else None
+        print(heading("V2 capacity", f"{device}, budget {args.budget_mb or 'device'} MB, strategies "
+                                     f"{', '.join(args.memory_strategy)}"), flush=True)
+        summary, d = ob.run_capacity(args.memory_strategy, device=device, budget=budget, blocks=blocks,
+                                     steps=args.steps)
+        text = ob.format_capacity(summary, budget)
+        print("\n" + text + f"\n\nresults: {d}/results.json, {d}/results.csv")
+        return 0
+    elif args.name == "offload-correctness":
+        from meshtrain.experiments.offload_correctness import run_offload_correctness
+
+        text, _rows = run_offload_correctness(device=args.device or "cpu", steps=args.steps)
+        print(text)
     elif args.name == "capacity":
         from meshtrain.experiments.capacity import run_experiment5
 
@@ -492,6 +542,139 @@ def cmd_experiment(args) -> int:
         from meshtrain.experiments.transformer import run_experiment_transformer
 
         print(run_experiment_transformer())
+    return 0
+
+
+# -- V2: tensors / memory ------------------------------------------------------
+def _default_device() -> str:
+    from meshtrain.worker.device import available_backends
+
+    return available_backends()[0]
+
+
+def _device_total(backend: str) -> int | None:
+    if backend == "cuda":
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).total_memory
+    return None
+
+
+def _residency_context(args):
+    """(cfg, spec, start, end, backend, budget, plan) for a config on this machine."""
+    from meshtrain.config import load_config
+    from meshtrain.planner.residency import plan_stage_residency
+
+    cfg = load_config(args.config)
+    spec = cfg.build_model_spec()
+    start, end = (0, spec.num_layers)
+    if getattr(args, "layers", None):
+        start, end = (int(x) for x in args.layers.split(":"))
+    backend = getattr(args, "device", None) or _default_device()
+    budget = (int(args.budget_mb * 1024**2) if getattr(args, "budget_mb", None)
+              else cfg.memory.budget_bytes(_device_total(backend), backend))
+    M = cfg.training.num_microbatches
+    policy = cfg.residency_policy()
+    plan = plan_stage_residency(spec, start, end, microbatch_size=cfg.training.batch_size // M, budget=budget,
+                                policy=policy, optimizer=cfg.training.optimizer, backend=backend,
+                                num_microbatches=M, schedule=cfg.pipeline.schedule)
+    return cfg, spec, start, end, backend, budget, plan
+
+
+def _planned_records(args):
+    from meshtrain.planner.residency import planned_tensor_records
+    from meshtrain.runtime.tensor_store import TensorRole
+
+    cfg, spec, start, end, backend, budget, plan = _residency_context(args)
+    static = cfg.memory.strategy == "static" and cfg.optimizer.execution == "accelerator"
+    recs = planned_tensor_records(spec, start, end, None if static else plan, optimizer=cfg.training.optimizer)
+    if getattr(args, "role", None):
+        role = TensorRole(args.role)
+        recs = [r for r in recs if r.role == role]
+    return recs, plan, static
+
+
+def cmd_tensors_list(args) -> int:
+    from meshtrain.runtime.tensor_store import format_tensor_table
+
+    recs, plan, static = _planned_records(args)
+    print(heading("MeshTrain tensors", "static (V1.5)" if static else f"{plan.strategy}, planned residency"))
+    print(format_tensor_table(recs, limit=args.limit))
+    return 0
+
+
+def cmd_tensors_inspect(args) -> int:
+    recs, _plan, _static = _planned_records(args)
+    match = [r for r in recs if r.tensor_id == args.tensor_id]
+    if not match:
+        near = [r.tensor_id for r in recs if args.tensor_id in r.tensor_id][:8]
+        print(paint(f"error: no tensor {args.tensor_id!r}" + (f"; similar: {', '.join(near)}" if near else ""), "bad"),
+              file=sys.stderr)
+        return 2
+    d = match[0].to_dict()
+    print(heading("Tensor", d["tensor_id"]))
+    for k, v in d.items():
+        print(f"  {k:<22} {v}")
+    return 0
+
+
+def cmd_memory_plan(args) -> int:
+    cfg, spec, start, end, backend, budget, plan = _residency_context(args)
+    print(heading("MeshTrain memory plan", f"{args.config} on {backend}, layers {start}-{end - 1}"))
+    print(f"  model parameters                 {spec.parameter_count() / 1e6:.1f}M")
+    print(plan.format())
+    return 0 if plan.feasible else 1
+
+
+def format_memory_status(records: list[dict]) -> str:
+    gb = lambda n: f"{(n or 0) / 1024**3:.2f} GB"  # noqa: E731
+    lines = [heading("MeshTrain Memory Status")]
+    for rec in records:
+        st, res, mem = rec.get("tensor_store") or {}, rec.get("residency") or {}, rec.get("memory") or {}
+        lines += ["", f"Worker: {rec.get('worker')}  (stage {rec.get('stage')}, {rec.get('backend')}, step {rec.get('step')})",
+                  "", "Accelerator:",
+                  f"  capacity       {gb(mem.get('device_total'))}",
+                  f"  budget         {gb(st.get('requested_budget')) if st.get('requested_budget') else 'none'}",
+                  f"  resident       {gb(st.get('accelerator_resident'))}   (model state, ledger)",
+                  f"  peak           {gb(st.get('accelerator_peak'))}   (ledger)   allocator peak {gb(mem.get('device_peak'))}",
+                  "", "RAM:", f"  resident       {gb(st.get('ram_resident'))}   pinned {gb(st.get('pinned_bytes'))}"]
+        if res:
+            lines += ["", f"Residency: {res.get('strategy')}, optimizer {res.get('optimizer_execution')}, "
+                          f"prefetch {res.get('prefetch_distance')}, {res.get('groups_hot')} hot / "
+                          f"{res.get('groups_cold')} offloaded layers",
+                      "", "Transfers (last step):",
+                      f"  RAM -> {rec.get('backend', 'device'):<8}{gb(res.get('H2D_bytes'))}",
+                      f"  {rec.get('backend', 'device'):<8}-> RAM {gb(res.get('D2H_bytes'))}",
+                      "", f"Prefetch hit   {res.get('tensor_cache_hit_ratio', 0):.0%}",
+                      f"stalls         {(res.get('prefetch_stall_ms', 0) + res.get('sync_load_ms', 0)) / 1000:.2f} s",
+                      f"evictions      {res.get('tensor_eviction_count')}"]
+        else:
+            lines.append("\nResidency: static (V1.5), nothing is offloaded")
+    if not records:
+        lines.append(paint("No step metrics yet. Train with meshtrain train CONFIG.", "dim"))
+    return "\n".join(lines)
+
+
+def cmd_memory_status(args) -> int:
+    latest: dict = {}
+    if args.run:
+        path = os.path.join(args.run, "metrics.jsonl")
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                rec = json.loads(line)
+                if rec.get("event") == "STEP_COMPLETE":
+                    latest[rec.get("stage")] = rec
+    else:
+        client = _client(args)
+        with client.http:
+            jobs = client.jobs()["jobs"]
+            if not jobs:
+                print(format_memory_status([]))
+                return 0
+            job = max(jobs, key=lambda j: j.get("created_at", 0))
+            latest = {int(k): v for k, v in (client.job(job["job_id"]).get("last_metrics") or {}).items()}
+    print(format_memory_status([latest[k] for k in sorted(latest)]))
     return 0
 
 
@@ -576,7 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
         b.add_argument("--no-network", action="store_true")
         b.add_argument("--output", help="write raw results JSON (input for `experiment placement --cluster`)")
         b.set_defaults(func=cmd_cluster_benchmark)
-    b.add_argument("what", nargs="?", default="cluster", choices=["cluster", "pipeline"])
+    b.add_argument("what", nargs="?", default="cluster", choices=["cluster", "pipeline", "offload"])
     b.add_argument("--config", help="pipeline: model/training config (default: built-in tiny Transformer)")
     b.add_argument("--stages", type=int, default=3, help="pipeline (local): number of stage processes")
     b.add_argument("--devices", help="pipeline (local): one device per stage, e.g. cuda,cuda")
@@ -587,6 +770,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="pipeline (local): emulated link bandwidth; 0 = raw loopback")
     b.add_argument("--latency-ms", type=float, default=1.0)
     b.add_argument("--cluster", action="store_true", help="pipeline: run the modes as jobs on the real cluster")
+    b.add_argument("--device", help="offload: cuda|mps|cpu (default: best available)")
+    b.add_argument("--budget-mb", type=float, help="offload: accelerator budget (CUDA allocator hard cap)")
+    b.add_argument("--strategies", help="offload: comma list of static,local-offload,optimizer-offload,"
+                                        "local-offload-prefetch,auto-offload")
+    b.add_argument("--sweep", choices=["none", "budget", "prefetch"], default="none")
+    b.add_argument("--budgets", default="1024,1536,2048,3072,4096", help="offload --sweep budget: MB list")
+    b.add_argument("--distances", default="0,1,2,3", help="offload --sweep prefetch: distances")
+    b.add_argument("--blocks", type=int, default=8, help="offload: transformer blocks (hidden 1280 family)")
+    b.add_argument("--hidden", type=int, default=1280)
     b.set_defaults(func=cmd_benchmark)
 
     pl = sub.add_parser("plan", parents=[common], help="preview model placement")
@@ -597,6 +789,38 @@ def build_parser() -> argparse.ArgumentParser:
     ip = ins.add_parser("placement", parents=[common], help="detailed placement plan for a config")
     ip.add_argument("config")
     ip.set_defaults(func=cmd_inspect_placement)
+
+    def residency_args(x, limit=True):
+        x.add_argument("config")
+        x.add_argument("--layers", help="stage layer range START:END (default: whole model)")
+        x.add_argument("--device", help="cuda|mps|cpu (default: best available)")
+        x.add_argument("--budget-mb", type=float, help="accelerator budget (default: memory.accelerator_budget*)")
+        if limit:
+            x.add_argument("--limit", type=int, default=40, help="rows to print")
+            x.add_argument("--role", choices=["parameter", "gradient", "optimizer_state"])
+
+    it = ins.add_parser("tensors", parents=[common], help="tensors of a config and their planned residency")
+    residency_args(it)
+    it.set_defaults(func=cmd_tensors_list)
+
+    tn = sub.add_parser("tensors", help="V2: tensor identities and residency").add_subparsers(dest="action",
+                                                                                             required=True)
+    tl = tn.add_parser("list", parents=[common], help="every tracked tensor with role, location and size")
+    residency_args(tl)
+    tl.set_defaults(func=cmd_tensors_list)
+    ti = tn.add_parser("inspect", parents=[common], help="metadata of one tensor id")
+    residency_args(ti, limit=False)
+    ti.add_argument("tensor_id")
+    ti.set_defaults(func=cmd_tensors_inspect, role=None)
+
+    me = sub.add_parser("memory", help="V2: memory residency plans and live status").add_subparsers(
+        dest="action", required=True)
+    mp_ = me.add_parser("plan", parents=[common], help="HOT/COLD layer plan for a config and budget")
+    residency_args(mp_, limit=False)
+    mp_.set_defaults(func=cmd_memory_plan)
+    ms = me.add_parser("status", parents=[common], help="accelerator/RAM residency of the latest job")
+    ms.add_argument("--run", help="read runs/<job>/metrics.jsonl instead of asking the coordinator")
+    ms.set_defaults(func=cmd_memory_status)
 
     t = sub.add_parser("train", parents=[common], help="train a model from a YAML config")
     t.add_argument("config")
@@ -615,13 +839,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     e = sub.add_parser("experiment", parents=[common],
                        help="run correctness, placement, capacity, or device experiments")
-    e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer", "device-correctness"])
+    e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer", "device-correctness",
+                                    "offload-correctness"])
     e.add_argument("--devices", default="cpu,cpu", help="device-correctness: one device per stage, e.g. cuda,cuda,mps")
     e.add_argument("--transport", default="tcp", choices=["pipe", "tcp"])
     e.add_argument("--mode", default="emulated", choices=["emulated", "hardware"],
                    help="capacity: emulated device budgets on CPU, or real devices of this cluster")
     e.add_argument("--cluster", help="JSON from `cluster benchmark --output` (else a documented example cluster)")
     e.add_argument("--steps", type=int, default=5)
+    e.add_argument("--memory-strategy", action="append", default=[],
+                   choices=["static", "local-offload", "optimizer-offload", "local-offload-prefetch", "auto-offload"],
+                   help="capacity: V2 single-device capacity search per strategy (repeatable)")
+    e.add_argument("--budget-mb", type=float, help="capacity --memory-strategy: accelerator budget (hard cap)")
+    e.add_argument("--blocks", help="capacity --memory-strategy: comma list of transformer block counts")
+    e.add_argument("--device", help="offload-correctness / capacity --memory-strategy: cuda|mps|cpu")
     e.set_defaults(func=cmd_experiment)
     return p
 

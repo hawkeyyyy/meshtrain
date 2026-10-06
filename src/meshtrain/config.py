@@ -115,6 +115,50 @@ class MemoryConfig(_Strict):
     max_replans: int = Field(2, ge=0)     # startup OOM -> replan with the measured budget, at most N times
     replan_shrink: float = Field(0.85, gt=0, lt=1)  # extra margin applied to a failed worker's budget
 
+    # -- V2 tensor residency (runtime/offload.py, docs/v2-architecture.md) --------
+    # static: V1.5 behaviour, every tensor stays on the stage's device.
+    # manual_offload: layers not listed in keep_resident live in local RAM between uses.
+    # auto_offload: planner/residency.py chooses which layers stay resident.
+    strategy: Literal["static", "manual_offload", "auto_offload"] = "static"
+    # Accelerator budget per stage: total bytes this process may allocate on its device.
+    # accelerator_budget_mb takes precedence; accelerator_budget accepts "auto", "6GB", "512MB".
+    accelerator_budget_mb: float | None = Field(None, gt=0)
+    accelerator_budget: str | None = None
+    # CUDA: also cap the caching allocator at the budget (real OOM beyond it, reproducible tests).
+    enforce_allocator_limit: bool = True
+    keep_resident: list[str] = []       # manual_offload: layers that stay on the device, e.g. "layers.0"
+    prefetch_distance: int = Field(1, ge=0)   # 0 = synchronous loads; N = load N offloaded layers ahead
+    # after_use: evict a layer after each forward/backward use (lowest memory).
+    # after_backward: keep a loaded layer until its last pending backward (conservative).
+    eviction: Literal["after_use", "after_backward"] = "after_use"
+    pin_host_memory: bool = True        # page-locked host copies (CUDA)
+    use_local_ram: bool = True
+    use_remote_ram: bool = False        # V2.5; not implemented
+    optimizer_offload: bool | None = None  # true = optimizer.execution cpu_offload
+
+    @model_validator(mode="after")
+    def _check_residency(self):
+        if self.use_remote_ram:
+            raise ValueError("memory.use_remote_ram: remote RAM tensor storage is not implemented yet")
+        if self.strategy != "static" and not self.use_local_ram:
+            raise ValueError(f"memory.strategy {self.strategy} needs use_local_ram: true")
+        if self.accelerator_budget is not None and self.accelerator_budget_mb is None:
+            parse_bytes(self.accelerator_budget)  # validate
+        return self
+
+    def budget_bytes(self, device_total: int | None = None, backend: str = "cuda") -> int | None:
+        """Resolved accelerator budget in bytes (None = unlimited / device size)."""
+        if self.accelerator_budget_mb is not None:
+            return int(self.accelerator_budget_mb * 1024**2)
+        if self.accelerator_budget in (None, ""):
+            return None
+        if self.accelerator_budget.strip().lower() == "auto":
+            if device_total is None:
+                return None
+            sf = self.safety_factors().get(backend, self.safety_factor)
+            return max(0, int(device_total * sf) - self.framework_reserve_bytes().get(backend, 0))
+        return parse_bytes(self.accelerator_budget)
+
     def safety_factors(self) -> dict[str, float]:
         out = {b: self.safety_factor for b in ("cuda", "mps", "cpu")}
         out.update(self.backend_safety_factor)
@@ -122,6 +166,27 @@ class MemoryConfig(_Strict):
 
     def framework_reserve_bytes(self) -> dict[str, int]:
         return {b: int(v * 1024**3) for b, v in self.framework_reserve_gb.items()}
+
+
+def parse_bytes(text: str) -> int:
+    """'6GB' / '512 MB' / '1.5GiB' / '2048' (MB) -> bytes (binary units)."""
+    s = str(text).strip().upper().replace(" ", "").replace("IB", "B")
+    for suffix, mult in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)):
+        if s.endswith(suffix):
+            try:
+                return int(float(s[: -len(suffix)]) * mult)
+            except ValueError:
+                break
+    try:
+        return int(float(s) * 1024**2)
+    except ValueError:
+        raise ValueError(f"cannot parse memory size {text!r}; use e.g. 6GB or 512MB") from None
+
+
+class OptimizerConfig(_Strict):
+    # accelerator: V1.5 behaviour, optimizer state and update on the stage's device.
+    # cpu_offload: optimizer state + fp32 master parameters in host RAM, update on the CPU (V2.3).
+    execution: Literal["accelerator", "cpu_offload"] = "accelerator"
 
 
 class WorkersConfig(_Strict):
@@ -163,6 +228,7 @@ class MeshTrainConfig(_Strict):
     pipeline: PipelineConfig = PipelineConfig()
     transport: TransportConfig = TransportConfig()
     memory: MemoryConfig = MemoryConfig()
+    optimizer: OptimizerConfig = OptimizerConfig()
 
     @model_validator(mode="after")
     def _check(self):
@@ -170,7 +236,22 @@ class MeshTrainConfig(_Strict):
             n = self.model_num_layers()
             if self.placement.stages[0].layers[0] != 0 or self.placement.stages[-1].layers[1] != n:
                 raise ValueError(f"manual stages must cover layers [0, {n})")
+        if self.memory.optimizer_offload is True:
+            self.optimizer.execution = "cpu_offload"
+        elif self.memory.optimizer_offload is False and self.optimizer.execution == "cpu_offload":
+            raise ValueError("memory.optimizer_offload: false contradicts optimizer.execution: cpu_offload")
         return self
+
+    def residency_policy(self):
+        """runtime.offload.ResidencyPolicy for this config (static = V1.5)."""
+        from meshtrain.runtime.offload import ResidencyPolicy
+
+        m = self.memory
+        return ResidencyPolicy(strategy=m.strategy, keep_resident=tuple(m.keep_resident),
+                               prefetch_distance=m.prefetch_distance, eviction=m.eviction,
+                               optimizer_execution=self.optimizer.execution, pin_host_memory=m.pin_host_memory,
+                               enforce_allocator_limit=m.enforce_allocator_limit,
+                               budget_mb=m.accelerator_budget_mb, budget_spec=m.accelerator_budget)
 
     def pipeline_settings(self, job_id: str, **overrides):
         """PipelineSettings for this config (shared by workers and local runs)."""

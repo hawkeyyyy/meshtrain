@@ -98,6 +98,56 @@ class DeviceAdapter(abc.ABC):
         self.synchronize()
         return lambda: (cpu, None)
 
+    # -- tensor residency (V2 offload, runtime/offload.py) --------------------
+    # Model state moves between host RAM (authoritative copy) and the device
+    # (working copy) with:
+    #   load:      offload_h2d_start(hosts) -> offload_h2d_ready(handle) ->
+    #              offload_h2d_finish(handle) -> device tensors usable by compute
+    #   writeback: offload_d2h(device tensors, host tensors)  (ordered after compute)
+    # Defaults are synchronous. CUDA overrides them with pinned host memory, the
+    # transfer stream and events so a prefetch overlaps compute.
+
+    def host_copy(self, tensor: torch.Tensor, pinned: bool = True) -> torch.Tensor:
+        """Contiguous host-RAM copy of ``tensor`` (page-locked when supported and requested)."""
+        pin = pinned and self.supports("pinned_memory")
+        out = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=pin)
+        out.copy_(tensor.detach())
+        return out
+
+    def offload_h2d_start(self, hosts: list[torch.Tensor]):
+        """Begin copying host tensors to the device; returns an opaque handle."""
+        out = [h.to(self.device, copy=True) for h in hosts]
+        self.synchronize()
+        return out
+
+    def offload_h2d_ready(self, handle) -> bool:
+        """True if the copy started by ``offload_h2d_start`` has completed."""
+        return True
+
+    def offload_h2d_wait(self, handle) -> None:
+        """Block the host until the copy has completed (used to measure stalls)."""
+
+    def offload_h2d_seconds(self, handle) -> float | None:
+        """Measured device duration of a completed copy, if the backend can time it."""
+        return None
+
+    def offload_h2d_finish(self, handle) -> list[torch.Tensor]:
+        """Device tensors of a started copy, safe to use on the compute stream."""
+        return handle
+
+    def offload_d2h(self, srcs: list[torch.Tensor], dsts: list[torch.Tensor]) -> None:
+        """Copy device tensors into existing host tensors, after queued compute; blocks until done."""
+        self.synchronize()
+        for s, d in zip(srcs, dsts):
+            d.copy_(s.detach())
+
+    def before_release(self) -> None:
+        """Called before device tensors of an evicted layer are dropped."""
+
+    def limit_memory(self, nbytes: int | None) -> bool:
+        """Hard-cap this process's device allocations (None removes the cap). False if unsupported."""
+        return False
+
     @abc.abstractmethod
     def name(self) -> str: ...
 
@@ -186,6 +236,15 @@ class CPUDeviceAdapter(DeviceAdapter):
         # The received buffer *is* the device tensor; it returns to the pool
         # only after the microbatch's backward (it is saved for backward).
         return host, host
+
+    def offload_h2d_start(self, hosts):
+        # The CPU "accelerator" working set is host RAM too: a real copy keeps the
+        # authoritative and working copies distinct, so offload logic is testable.
+        return [h.clone() for h in hosts]
+
+    def offload_d2h(self, srcs, dsts):
+        for s, d in zip(srcs, dsts):
+            d.copy_(s.detach())
 
     def name(self) -> str:
         return platform.processor() or platform.machine() or "cpu"
@@ -285,6 +344,54 @@ class CUDADeviceAdapter(DeviceAdapter):
         t.record_stream(compute)
         return t
 
+    def offload_h2d_start(self, hosts):
+        # Copies run on the transfer stream; pinned sources make them truly
+        # asynchronous so a prefetch overlaps kernels on the compute stream.
+        with torch.cuda.device(self.index), torch.cuda.stream(self.transfer_stream):
+            start = torch.cuda.Event(enable_timing=True)
+            start.record(self.transfer_stream)
+            out = [h.to(self.device, non_blocking=h.is_pinned()) for h in hosts]
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record(self.transfer_stream)
+        return out, ev, start
+
+    def offload_h2d_ready(self, handle) -> bool:
+        return handle[1].query()
+
+    def offload_h2d_wait(self, handle) -> None:
+        handle[1].synchronize()
+
+    def offload_h2d_seconds(self, handle) -> float | None:
+        return handle[2].elapsed_time(handle[1]) / 1000.0 if handle[1].query() else None
+
+    def offload_h2d_finish(self, handle):
+        out, ev, _start = handle
+        compute = torch.cuda.current_stream(self.device)
+        compute.wait_event(ev)
+        for t in out:
+            # Allocated on the transfer stream, used on the compute stream: the
+            # allocator must not reuse the block until compute work using it is done.
+            t.record_stream(compute)
+        return out
+
+    def offload_d2h(self, srcs, dsts):
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        with torch.cuda.device(self.index), torch.cuda.stream(self.transfer_stream):
+            self.transfer_stream.wait_event(ready)
+            for s, d in zip(srcs, dsts):
+                d.copy_(s.detach(), non_blocking=d.is_pinned())
+                s.record_stream(self.transfer_stream)
+            done = torch.cuda.Event()
+            done.record(self.transfer_stream)
+        done.synchronize()
+
+    def limit_memory(self, nbytes):
+        total = self.memory_total()
+        fraction = 1.0 if nbytes is None else max(1e-4, min(1.0, nbytes / total))
+        torch.cuda.set_per_process_memory_fraction(fraction, self.index)
+        return True
+
     def name(self) -> str:
         return torch.cuda.get_device_name(self.index)
 
@@ -347,6 +454,11 @@ class MPSDeviceAdapter(DeviceAdapter):
     # (de)serialisation still overlap with compute on the transport threads.
     # Correctness over forced asynchrony: we never assume MPS copy ordering
     # semantics PyTorch does not document.
+
+    def before_release(self) -> None:
+        # No documented stream semantics to rely on: make sure queued kernels that
+        # read an evicted layer's weights have finished before the tensors are dropped.
+        torch.mps.synchronize()
 
     def supports(self, operation: str, dtype: str | None = None) -> bool:
         if dtype is None and operation in ("pinned_memory", "nccl", "async_copy"):

@@ -33,7 +33,8 @@ class LocalStage:
 
 
 def _stage_process(index, stages, model_cfg, seed, settings, optimizer, lr, transport, links,
-                   results, capture_params, torch_threads, link_emulation=None):
+                   results, capture_params, torch_threads, link_emulation=None, residency=None,
+                   accelerator_budget=None):
     os.environ.setdefault("MESHTRAIN_QUIET", "1")
     threads = stages[index].threads or torch_threads
     if threads:
@@ -70,9 +71,21 @@ def _stage_process(index, stages, model_cfg, seed, settings, optimizer, lr, tran
             bw, lat = link_emulation
             up = EmulatedLink(up, bw, lat) if up is not None else None
             down = EmulatedLink(down, bw, lat) if down is not None else None
+        adapter = select_device(st.device)
+        policy = residency
+        if residency is not None:
+            from meshtrain.planner.residency import resolve_stage_policy
+
+            M = settings.num_microbatches
+            policy, _plan = resolve_stage_policy(residency, spec, *st.layers, microbatch_size=settings.batch_size // M,
+                                                 budget=accelerator_budget, optimizer=optimizer,
+                                                 backend=adapter.backend, num_microbatches=M,
+                                                 schedule=settings.schedule, stage_index=index,
+                                                 num_stages=len(stages))
         stage = Stage(spec.build_stage(*st.layers), stage_index=index, num_stages=len(stages),
-                      device=select_device(st.device), optimizer=optimizer, lr=lr, loss_fn=spec.loss_fn,
-                      name=worker, layer_offset=st.layers[0])
+                      device=adapter, optimizer=optimizer, lr=lr, loss_fn=spec.loss_fn,
+                      name=worker, layer_offset=st.layers[0], residency=policy,
+                      accelerator_budget=accelerator_budget)
         logger = EventLogger(worker, settings.job_id)
         res = run_stage(stage, spec, settings, upstream=up, downstream=down, worker=worker,
                         logger=logger, capture_params=capture_params)
@@ -140,8 +153,11 @@ def run_local_pipeline(
     torch_threads: int | None = 1,
     timeout_s: float = 600.0,
     link_emulation: tuple[float, float] | None = None,
+    residency=None,
+    accelerator_budget: int | None = None,
 ) -> list[StageResult]:
-    """``link_emulation=(bandwidth_Bps, latency_s)`` throttles every link (experiments only)."""
+    """``link_emulation=(bandwidth_Bps, latency_s)`` throttles every link (experiments only).
+    ``residency`` (runtime.offload.ResidencyPolicy) / ``accelerator_budget`` apply to every stage (V2)."""
     ctx = mp.get_context("spawn")
     results = ctx.Queue()
     manager = None
@@ -155,7 +171,7 @@ def run_local_pipeline(
     procs = [
         ctx.Process(target=_stage_process, name=f"meshtrain-stage{i}",
                     args=(i, stages, model_cfg, seed, settings, optimizer, lr, transport, links, results,
-                          capture_params, torch_threads, link_emulation))
+                          capture_params, torch_threads, link_emulation, residency, accelerator_budget))
         for i in range(len(stages))
     ]
     for p in procs:

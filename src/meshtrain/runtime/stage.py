@@ -8,7 +8,7 @@ tensors out.
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from torch import nn
@@ -21,8 +21,12 @@ from meshtrain.runtime.distributed_autograd import (
     boundary_input_grad,
     make_boundary_input,
 )
+from meshtrain.runtime.offload import _ParamRef
 from meshtrain.runtime.tensor_store import LocalTensorStore, TensorRole, activation_id, parameter_id
 from meshtrain.worker.device import CPUDeviceAdapter, DeviceAdapter
+
+if TYPE_CHECKING:
+    from meshtrain.runtime.offload import ResidencyPolicy
 
 
 def build_optimizer(name: str, params, lr: float, **kwargs) -> torch.optim.Optimizer:
@@ -49,12 +53,34 @@ class Stage:
         loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         name: str | None = None,
         layer_offset: int = 0,
+        residency: "ResidencyPolicy | None" = None,
+        accelerator_budget: int | None = None,
     ):
         self.device = device or CPUDeviceAdapter()
-        self.module = self.device.move_module(module)
         self.stage_index = stage_index
         self.num_stages = num_stages
         self.name = name or f"stage{stage_index}"
+        self.layer_offset = layer_offset
+        self.residency_policy = residency
+        self.accelerator_budget = accelerator_budget
+        self.residency = None  # ResidencyManager when a V2 offload policy is active
+        if residency is not None and accelerator_budget is not None and residency.enforce_allocator_limit:
+            self.device.limit_memory(accelerator_budget)
+        offload = residency is not None and residency.active
+        self.tensor_store = LocalTensorStore(self.name, self.device.backend, device=self.device,
+                                             compute_stage=stage_index, accelerator_budget=accelerator_budget,
+                                             offload=offload)
+        if offload:
+            from meshtrain.runtime.offload import ResidencyManager
+
+            for p in module.parameters():
+                if not self.device.supports_dtype(p.dtype):
+                    raise TypeError(f"{self.device.backend} does not support parameter dtype {p.dtype}")
+            self.module = module
+            self.residency = ResidencyManager(module, self.device, self.tensor_store, residency,
+                                              layer_offset=layer_offset, optimizer=optimizer)
+        else:
+            self.module = self.device.move_module(module)
         self.optimizer = build_optimizer(optimizer, self.module.parameters(), lr) if any(
             True for _ in self.module.parameters()) else None
         self.loss_fn = loss_fn
@@ -62,11 +88,10 @@ class Stage:
         self._param_ids = {id(p) for p in self.module.parameters()}
         if self.is_last and loss_fn is None:
             raise ValueError("the last stage needs a loss function")
-        # Stable identities for everything this stage owns (V2 preparation; no movement).
-        self.layer_offset = layer_offset
-        self.tensor_store = LocalTensorStore(self.name, self.device.backend)
-        for n, p in self.module.named_parameters():
-            self.tensor_store.put(self.global_name(n), p, TensorRole.PARAMETER)
+        # Stable identities for everything this stage owns.
+        if not offload:
+            for n, p in self.module.named_parameters():
+                self.tensor_store.put(self.global_name(n), p, TensorRole.PARAMETER)
 
     def global_name(self, local_name: str) -> str:
         """'3.qkv.weight' inside this stage -> 'model.layers.<offset+3>.qkv.weight'."""
@@ -75,6 +100,9 @@ class Stage:
 
     def refresh_tensor_store(self) -> None:
         """Record gradients and optimizer state (they appear lazily during training)."""
+        if self.residency is not None:
+            self.residency.refresh_records(self.optimizer)
+            return
         store = self.tensor_store
         for n, p in self.module.named_parameters():
             gid = self.global_name(n)
@@ -111,8 +139,21 @@ class Stage:
                 saved += t.numel() * t.element_size()
             return t
 
+        unpack = _identity
+        res = self.residency
+        if res is not None:
+            # Offloaded parameters are saved by reference and reloaded on demand in backward.
+            count = pack
+
+            def pack(t):  # noqa: F811
+                ref = res.pack(t)
+                return count(t) if ref is None else ref
+
+            def unpack(obj):
+                return res.unpack(obj) if isinstance(obj, _ParamRef) else obj
+
         # Count what autograd keeps alive for backward (excluding parameters).
-        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
             out = self.module(x)
         context.autograd_saved_bytes = saved
         self.device.sync_compute()
@@ -138,6 +179,7 @@ class Stage:
         self.contexts.pop(context.step_id, context.microbatch_id)
         self.tensor_store.discard(activation_id(context.step_id, context.microbatch_id, self.stage_index))
         (loss * loss_scale).backward()
+        self._after_backward()
         self.device.sync_compute()
         context.timings["backward"] = time.perf_counter() - t0
         grad = boundary_input_grad(context.input)
@@ -157,6 +199,7 @@ class Stage:
         t0 = time.perf_counter()
         loss = self.loss_fn(ctx.output, self.device.move_tensor(target))
         (loss * loss_scale).backward()
+        self._after_backward()
         self.device.sync_compute()
         ctx.timings["backward"] = time.perf_counter() - t0
         grad = boundary_input_grad(ctx.input) if not self.is_first else None
@@ -169,6 +212,7 @@ class Stage:
         self.tensor_store.discard(activation_id(*context_key, self.stage_index))
         t0 = time.perf_counter()
         boundary_backward(ctx.output, self.device.move_tensor(grad_output))
+        self._after_backward()
         self.device.sync_compute()
         ctx.timings["backward"] = time.perf_counter() - t0
         grad = boundary_input_grad(ctx.input) if not self.is_first else None
@@ -180,7 +224,10 @@ class Stage:
             raise BoundaryError(f"optimizer step with pending microbatches {self.contexts.pending()}")
         t0 = time.perf_counter()
         if self.optimizer is not None:
-            self.optimizer.step()
+            if self.residency is not None:
+                self.residency.optimizer_step(self.optimizer)
+            else:
+                self.optimizer.step()
         self.device.sync_compute()
         return time.perf_counter() - t0
 
@@ -189,18 +236,38 @@ class Stage:
             self.optimizer.zero_grad(set_to_none=True)
         else:
             self.module.zero_grad(set_to_none=True)
+        if self.residency is not None:
+            self.residency.zero_grad()
+
+    def _after_backward(self) -> None:
+        if self.residency is not None:
+            self.residency.after_backward_call()
+
+    def close(self) -> None:
+        """Release hooks and the allocator cap (worker processes run several jobs)."""
+        if self.residency is not None:
+            self.residency.close()
+        if self.residency_policy is not None and self.accelerator_budget is not None:
+            self.device.limit_memory(None)
 
     # ------------------------------------------------------------------
+    def _grad(self, p) -> torch.Tensor | None:
+        return self.residency.gradient(p) if self.residency is not None else p.grad
+
     def named_gradients(self, prefix: str = "") -> dict[str, torch.Tensor]:
-        return {f"{prefix}{n}": p.grad.detach().cpu().clone()
-                for n, p in self.module.named_parameters() if p.grad is not None}
+        out = {}
+        for n, p in self.module.named_parameters():
+            g = self._grad(p)
+            if g is not None:
+                out[f"{prefix}{n}"] = g.detach().cpu().clone()
+        return out
 
     def named_parameters_cpu(self, prefix: str = "") -> dict[str, torch.Tensor]:
         return {f"{prefix}{n}": p.detach().cpu().clone() for n, p in self.module.named_parameters()}
 
     def memory_report(self) -> dict[str, int]:
         params = sum(p.numel() * p.element_size() for p in self.module.parameters())
-        grads = sum(p.grad.numel() * p.grad.element_size() for p in self.module.parameters() if p.grad is not None)
+        grads = sum(g.numel() * g.element_size() for g in map(self._grad, self.module.parameters()) if g is not None)
         opt = 0
         if self.optimizer is not None:
             for state in self.optimizer.state.values():
@@ -209,3 +276,7 @@ class Stage:
                         opt += v.numel() * v.element_size()
         return {"parameters": params, "gradients": grads, "optimizer_state": opt,
                 "saved_activations": self.contexts.saved_bytes()}
+
+
+def _identity(t):
+    return t

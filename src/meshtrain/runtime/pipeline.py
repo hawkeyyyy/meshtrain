@@ -177,6 +177,8 @@ def run_stage(
     S, sidx = stage.num_stages, stage.stage_index
     links = {k: v for k, v in ((UPSTREAM, upstream), (DOWNSTREAM, downstream)) if v is not None}
     tl = timeline or Timeline(worker, sidx)
+    if stage.residency is not None:
+        stage.residency.timeline = tl
     max_out = settings.max_outbound_queue or (2 * M + 4)
     inbox = Inbox(links, tl, maxsize=4 * M + 16) if links else None
     events = inbox.queue if inbox else queue.Queue()
@@ -306,6 +308,8 @@ def run_stage(
             t_step0 = tl.now()
             if stage.is_first:
                 dev.reset_peak_memory()
+            if stage.residency is not None:
+                stage.residency.step_begin(step)
             sm = StageStateMachine(sidx, S, M, step, settings.schedule, settings.max_inflight_microbatches)
             st.update(sm=sm, bufs=_StepBuffers(), step=step, bytes_received=st.get("bytes_received", 0))
             bytes_recv0, sent0 = st["bytes_received"], dict(outbox.bytes_sent)
@@ -408,6 +412,8 @@ def run_stage(
                 "communication_s": m["communication_s"], "overlapped_s": m["overlapped_s"],
                 "exposed_communication_s": m["exposed_communication_s"], "overlap_ratio": m["overlap_ratio"],
                 "idle_s": m["idle_s"],
+                "memory_transfer_s": m["memory_transfer_s"], "memory_overlapped_s": m["memory_overlapped_s"],
+                "exposed_memory_transfer_s": m["exposed_memory_transfer_s"],
                 "wait_forward_s": phase.get("WAIT_FORWARD", 0.0), "wait_backward_s": phase.get("WAIT_BACKWARD", 0.0),
                 "bytes_sent": bytes_sent, "bytes_received": st["bytes_received"] - bytes_recv0,
                 "lifecycle": {k: v for k, v in phase.items() if not k.startswith("WAIT")},
@@ -419,6 +425,9 @@ def run_stage(
                 "memory": {**mem, "device_allocated": dev_mem.get("allocated", 0),
                            "device_peak": dev_mem.get("peak_allocated", 0), "device_total": dev_mem.get("total", 0)},
             }
+            if stage.residency is not None:
+                record["residency"] = stage.residency.step_stats()
+            record["tensor_store"] = stage.tensor_store.stats()
             if probe:
                 record["correctness"] = correctness  # local parameter names (layer index within the stage)
             if stage.is_first:
