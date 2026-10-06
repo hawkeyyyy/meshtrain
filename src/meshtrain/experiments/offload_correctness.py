@@ -25,20 +25,37 @@ from meshtrain.runtime.stage import Stage
 from meshtrain.worker.device import select_device
 
 
+def layer_factory(spec):
+    """``factory(global_index, meta=False)``: one layer at a time (lazy stage construction, V2.5)."""
+    def factory(i, meta=False):
+        return spec._make_layer(i).to(spec.dtype) if meta else spec.build_layer(i)
+    return factory
+
+
 def build_single_stage(model_cfg: dict, *, device: str = "cpu", policy: ResidencyPolicy | None = None,
                        budget_bytes: int | None = None, optimizer: str = "adamw", lr: float = 1e-3, seed: int = 0,
-                       microbatch_size: int = 2):
-    """One stage holding the whole model. ``auto_offload`` policies are resolved here."""
+                       microbatch_size: int = 2, num_microbatches: int = 4, lazy: bool | None = None,
+                       network_Bps: float | None = None, remote_client=None):
+    """One stage holding the whole model. ``auto_offload`` / ``remote_offload`` policies are planned here."""
     spec = build_model_spec(model_cfg, seed=seed)
     adapter = select_device(device)
-    if policy is not None and policy.strategy == "auto_offload" and policy.resident_groups is None:
+    if policy is not None and policy.strategy in ("auto_offload", "remote_offload") and policy.resident_groups is None:
         from meshtrain.planner.residency import plan_stage_residency
 
         plan = plan_stage_residency(spec, 0, spec.num_layers, microbatch_size=microbatch_size, budget=budget_bytes,
-                                    policy=policy, optimizer=optimizer, backend=adapter.backend)
+                                    policy=policy, optimizer=optimizer, backend=adapter.backend,
+                                    num_microbatches=num_microbatches,
+                                    remote_budget=policy.remote.budget_bytes if policy.remote else None,
+                                    network_Bps=network_Bps)
         policy = plan.apply(policy)
-    stage = Stage(spec.build_full(), stage_index=0, num_stages=1, device=adapter, optimizer=optimizer, lr=lr,
-                  loss_fn=spec.loss_fn, name="single", residency=policy, accelerator_budget=budget_bytes)
+    if lazy is None:
+        lazy = policy is not None and policy.strategy == "remote_offload"
+    kw = dict(stage_index=0, num_stages=1, device=adapter, optimizer=optimizer, lr=lr, loss_fn=spec.loss_fn,
+              name="single", residency=policy, accelerator_budget=budget_bytes, remote_client=remote_client)
+    if lazy:
+        stage = Stage(None, layer_factory=layer_factory(spec), num_layers=spec.num_layers, **kw)
+    else:
+        stage = Stage(spec.build_full(), **kw)
     return stage, spec
 
 
@@ -56,7 +73,8 @@ def train_trace(model_cfg: dict, *, policy: ResidencyPolicy | None = None, devic
                 optimizer: str = "adamw", lr: float = 1e-3, seed: int = 0, schedule: str = "1f1b",
                 capture: bool = True) -> Trace:
     stage, spec = build_single_stage(model_cfg, device=device, policy=policy, budget_bytes=budget_bytes,
-                                     optimizer=optimizer, lr=lr, seed=seed, microbatch_size=microbatch_size)
+                                     optimizer=optimizer, lr=lr, seed=seed, microbatch_size=microbatch_size,
+                                     num_microbatches=batch_size // microbatch_size)
     probe_x, _ = spec.make_batch(10_000, microbatch_size)
     trace = Trace([], [], [], [], [])
     try:

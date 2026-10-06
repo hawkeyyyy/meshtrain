@@ -126,9 +126,13 @@ def _run_worker(args, address: str, token: str) -> int:
 
     agent = WorkerAgent(address, token, device=args.device, name=args.name,
                         data_port=args.data_port, advertise_host=args.advertise_host, runs_dir=args.runs_dir,
-                        quick_benchmark=args.quick_benchmark)
+                        quick_benchmark=args.quick_benchmark,
+                        remote_ram_budget_mb=getattr(args, "remote_ram_budget_mb", 0) or 0,
+                        remote_ram_reserve_system_gb=getattr(args, "remote_ram_reserve_system_gb", 4.0))
+    lend = (f"  lends {args.remote_ram_budget_mb / 1024:.1f} GB RAM" if getattr(args, "remote_ram_budget_mb", 0)
+            else "")
     print(f"MeshTrain worker {agent.name}: backend={agent.device.backend} device={agent.device.name()} "
-          f"data-plane port={agent.dataplane.port}  (Ctrl-C to leave)", flush=True)
+          f"data-plane port={agent.dataplane.port}{lend}  (Ctrl-C to leave)", flush=True)
     try:
         agent.run_forever()
     except KeyboardInterrupt:
@@ -280,6 +284,36 @@ def cmd_dashboard(args) -> int:
 
     run_dashboard(_client(args), args.port)
     return 0
+
+
+def _remote_address(args) -> tuple[str, str] | None:
+    """(host:port, worker name) of the remote RAM worker: --remote, or --remote-worker via the coordinator."""
+    if getattr(args, "remote", None):
+        return args.remote, args.remote
+    name = getattr(args, "remote_worker", None)
+    if not name:
+        return None
+    client = _client(args)
+    with client.http:
+        for w in remote_workers(client.status()):
+            if name in (w["worker_id"], w.get("name")):
+                return f"{w['data_host']}:{w['data_port']}", w["worker_id"]
+    raise ValueError(f"no online worker {name!r} lends RAM (meshtrain remote status)")
+
+
+def _remote_overrides(args) -> dict:
+    """V2.5 budget / remote-RAM overrides for offload benchmark trials."""
+    ov = {}
+    if getattr(args, "local_ram_budget_mb", None):
+        ov["local_ram_budget_mb"] = args.local_ram_budget_mb
+    addr = _remote_address(args)
+    if addr is not None:
+        ov["remote"] = {"address": addr[0], "worker": addr[1], "token": _token(args),
+                        "budget_bytes": int(args.remote_ram_budget_mb * 1024**2) if args.remote_ram_budget_mb else None,
+                        "checksum": args.remote_checksum,
+                        "emulate_bandwidth_Bps": args.emulate_bandwidth_mbps * 1e6 / 8 if args.emulate_bandwidth_mbps
+                        else None}
+    return ov
 
 
 def cmd_benchmark_offload(args) -> int:
@@ -525,8 +559,10 @@ def cmd_experiment(args) -> int:
         blocks = [int(x) for x in args.blocks.split(",")] if args.blocks else None
         print(heading("V2 capacity", f"{device}, budget {args.budget_mb or 'device'} MB, strategies "
                                      f"{', '.join(args.memory_strategy)}"), flush=True)
+        overrides = _remote_overrides(args)
         summary, d = ob.run_capacity(args.memory_strategy, device=device, budget=budget, blocks=blocks,
-                                     steps=args.steps)
+                                     steps=args.steps, overrides=overrides or None,
+                                     name="remote-capacity" if overrides.get("remote") else "offload-capacity")
         text = ob.format_capacity(summary, budget)
         print("\n" + text + f"\n\nresults: {d}/results.json, {d}/results.csv")
         return 0
@@ -686,6 +722,76 @@ def cmd_memory_status(args) -> int:
     return 0
 
 
+def cmd_tensor_server(args) -> int:
+    from meshtrain.networking.tensor_server import serve_tensor_store
+
+    token = args.token or os.environ.get("MESHTRAIN_TOKEN") or load_saved().get("token")
+    if not token:
+        print(paint("warning: no --token / $MESHTRAIN_TOKEN: the tensor service accepts any client", "warn"),
+              file=sys.stderr)
+
+    def ready(server, port):
+        print(heading("MeshTrain remote RAM", f"{server.name} on port {port}"))
+        print(f"  lending up to {server.budget / 1024**3:.2f} GB, keeping "
+              f"{server.reserve_system / 1024**3:.1f} GB free for the system  (Ctrl-C to stop)", flush=True)
+
+    try:
+        serve_tensor_store(args.host, args.port, int(args.budget_mb * 1024**2), token=token, name=args.name or
+                           __import__("platform").node(), reserve_system_bytes=int(args.reserve_system_gb * 1024**3),
+                           on_ready=ready)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def remote_workers(status: dict) -> list[dict]:
+    return [w for w in status.get("workers", []) if (w.get("memory") or {}).get("remote_ram_budget")]
+
+
+def format_remote_status(workers: list[dict], probes: dict | None = None) -> str:
+    gb = lambda n: f"{(n or 0) / 1024**3:.1f} GB"  # noqa: E731
+    probes = probes or {}
+    lines = [heading("Remote Memory Workers"), ""]
+    rows = []
+    for w in workers:
+        m = w.get("memory") or {}
+        free = max(0, m.get("remote_ram_budget", 0) - m.get("remote_ram_reserved", 0))
+        pr = probes.get(w["worker_id"]) or {}
+        rows.append([w["worker_id"], gb(m.get("ram_total")), gb(m.get("remote_ram_reserve_system")),
+                     gb(m.get("remote_ram_budget")), gb(m.get("remote_ram_used")), gb(free),
+                     f"{pr['rtt_s'] * 1000:.1f} ms" if pr.get("rtt_s") else "-",
+                     f"{pr['bandwidth_Bps'] * 8 / 1e6:.0f} Mbps" if pr.get("bandwidth_Bps") else "-",
+                     w.get("status", "")])
+    lines.append(table(["WORKER", "TOTAL", "RESERVED", "BUDGET", "USED", "FREE", "RTT", "BANDWIDTH", "STATUS"],
+                       rows, [14, 8, 9, 8, 8, 8, 9, 10, 8]))
+    if not workers:
+        lines.append(paint("No worker lends RAM. Start one with: meshtrain join CODE --remote-ram-budget-mb 8192",
+                           "dim"))
+    elif not probes:
+        lines.append(paint("RTT/bandwidth: run meshtrain remote status --probe", "dim"))
+    return "\n".join(lines)
+
+
+def cmd_remote_status(args) -> int:
+    client = _client(args)
+    with client.http:
+        workers = remote_workers(client.status())
+    probes = {}
+    if args.probe:
+        from meshtrain.networking.tensor_server import RemoteTensorClient
+
+        for w in workers:
+            try:
+                c = RemoteTensorClient(w["data_host"], int(w["data_port"]), token=_token(args), job_id="probe",
+                                       worker=w["worker_id"], timeout_s=30)
+                probes[w["worker_id"]] = c.probe(payload_mb=args.payload_mb)
+                c.close()
+            except Exception as exc:
+                probes[w["worker_id"]] = {"error": str(exc)}
+    print(format_remote_status(workers, probes))
+    return 0
+
+
 def cmd_results_record(args) -> int:
     from meshtrain.experiments.record import record_run
 
@@ -727,6 +833,10 @@ def build_parser() -> argparse.ArgumentParser:
         j.add_argument("--advertise-host", help="address peers should use to reach this machine")
         j.add_argument("--runs-dir", default="runs")
         j.add_argument("--quick-benchmark", action="store_true")
+        j.add_argument("--remote-ram-budget-mb", type=float, default=0,
+                       help="V2.5: lend this much RAM to other workers' jobs (remote tensor memory)")
+        j.add_argument("--remote-ram-reserve-system-gb", type=float, default=4.0,
+                       help="RAM always left free for the OS when lending (default 4 GB)")
 
     # Short forms: `meshtrain start`, `meshtrain join CODE`, `meshtrain status`, `meshtrain benchmark`.
     st = sub.add_parser("start", parents=[common],
@@ -821,6 +931,21 @@ def build_parser() -> argparse.ArgumentParser:
     ti.add_argument("tensor_id")
     ti.set_defaults(func=cmd_tensors_inspect, role=None)
 
+    ts = sub.add_parser("tensor-server", parents=[common],
+                        help="V2.5: lend this machine's RAM as remote tensor memory (no coordinator needed)")
+    ts.add_argument("--budget-mb", type=float, required=True, help="RAM to lend (MB)")
+    ts.add_argument("--port", type=int, default=29600)
+    ts.add_argument("--host", default="0.0.0.0")
+    ts.add_argument("--name", help="display name (default: hostname)")
+    ts.add_argument("--reserve-system-gb", type=float, default=4.0, help="RAM always left free (default 4 GB)")
+    ts.set_defaults(func=cmd_tensor_server)
+
+    rm = sub.add_parser("remote", help="V2.5: remote RAM workers").add_subparsers(dest="action", required=True)
+    rs = rm.add_parser("status", parents=[common], help="workers that lend RAM, usage, RTT and bandwidth")
+    rs.add_argument("--probe", action="store_true", help="measure RTT and sustained bandwidth from this machine")
+    rs.add_argument("--payload-mb", type=float, default=64.0)
+    rs.set_defaults(func=cmd_remote_status)
+
     me = sub.add_parser("memory", help="V2: memory residency plans and live status").add_subparsers(
         dest="action", required=True)
     mp_ = me.add_parser("plan", parents=[common], help="HOT/COLD layer plan for a config and budget")
@@ -845,6 +970,14 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--reference-steps", type=int, default=20)
     rr.set_defaults(func=cmd_results_record)
 
+    def remote_args(x):
+        x.add_argument("--local-ram-budget-mb", type=float, help="V2.5: host RAM MeshTrain may use for model state")
+        x.add_argument("--remote-ram-budget-mb", type=float, help="V2.5: remote RAM budget reserved on the worker")
+        x.add_argument("--remote", help="V2.5: remote RAM tensor service HOST:PORT")
+        x.add_argument("--remote-worker", help="V2.5: remote RAM worker name (resolved via the coordinator)")
+        x.add_argument("--remote-checksum", default="crc32", choices=["none", "crc32"])
+        x.add_argument("--emulate-bandwidth-mbps", type=float, help="experiments: throttle the remote link")
+
     e = sub.add_parser("experiment", parents=[common],
                        help="run correctness, placement, capacity, or device experiments")
     e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer", "device-correctness",
@@ -857,11 +990,13 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--steps", type=int, default=5)
     e.add_argument("--memory-strategy", action="append", default=[],
                    choices=["static", "local-offload", "optimizer-offload", "local-offload-prefetch", "auto-offload",
-                            "auto-offload-gpu-optimizer"],
+                            "auto-offload-gpu-optimizer", "local-offload-reuse", "remote-offload",
+                            "remote-offload-noreuse"],
                    help="capacity: V2 single-device capacity search per strategy (repeatable)")
     e.add_argument("--budget-mb", type=float, help="capacity --memory-strategy: accelerator budget (hard cap)")
     e.add_argument("--blocks", help="capacity --memory-strategy: comma list of transformer block counts")
     e.add_argument("--device", help="offload-correctness / capacity --memory-strategy: cuda|mps|cpu")
+    remote_args(e)
     e.set_defaults(func=cmd_experiment)
     return p
 

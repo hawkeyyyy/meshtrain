@@ -101,6 +101,39 @@ class PlacementConfig(_Strict):
         return self
 
 
+class RemoteRamConfig(_Strict):
+    """V2.5: RAM on another machine as a backing tier (networking/tensor_server.py)."""
+
+    enabled: bool = False
+    budget_mb: float | None = Field(None, gt=0)   # this job's remote RAM budget (reserved up front)
+    max_bytes: int | None = Field(None, gt=0)      # same, in bytes (budget_mb wins when both are set)
+    workers: list[str] = []            # explicit tensor-service addresses "host:port"
+    preferred_workers: list[str] = []  # worker names resolved through the coordinator
+    max_inflight_fetches: int = Field(2, ge=1)
+    max_inflight_writebacks: int = Field(2, ge=1)
+    checksum: Literal["none", "crc32"] = "none"
+    timeout_s: float = Field(120.0, gt=0)
+    emulate_bandwidth_mbps: float | None = Field(None, gt=0)   # experiments only: throttle the link
+    emulate_latency_ms: float = Field(0.0, ge=0)
+
+    def budget_bytes(self) -> int | None:
+        if self.budget_mb is not None:
+            return int(self.budget_mb * 1024**2)
+        return self.max_bytes
+
+
+class ReuseConfig(_Strict):
+    # layer-major execution on single-stage jobs: load each offloaded layer once per pass
+    # for all microbatches instead of once per microbatch (V2.5)
+    enabled: bool = False
+
+
+class PrefetchConfig(_Strict):
+    enabled: bool = True
+    distance: int | None = Field(None, ge=0)        # overrides memory.prefetch_distance
+    remote_distance: int | None = Field(None, ge=0)  # remote RAM -> local staging look-ahead
+
+
 class MemoryConfig(_Strict):
     """Planner safety margins and runtime memory validation (planner/memory.py)."""
 
@@ -119,7 +152,7 @@ class MemoryConfig(_Strict):
     # static: V1.5 behaviour, every tensor stays on the stage's device.
     # manual_offload: layers not listed in keep_resident live in local RAM between uses.
     # auto_offload: planner/residency.py chooses which layers stay resident.
-    strategy: Literal["static", "manual_offload", "auto_offload"] = "static"
+    strategy: Literal["static", "manual_offload", "auto_offload", "remote_offload"] = "static"
     # Accelerator budget per stage: total bytes this process may allocate on its device.
     # accelerator_budget_mb takes precedence; accelerator_budget accepts "auto", "6GB", "512MB".
     accelerator_budget_mb: float | None = Field(None, gt=0)
@@ -133,13 +166,21 @@ class MemoryConfig(_Strict):
     eviction: Literal["after_use", "after_backward"] = "after_use"
     pin_host_memory: bool = True        # page-locked host copies (CUDA)
     use_local_ram: bool = True
-    use_remote_ram: bool = False        # V2.5; not implemented
+    use_remote_ram: bool = False        # alias for remote_ram.enabled
     optimizer_offload: bool | None = None  # true = optimizer.execution cpu_offload
+    local_ram_budget_mb: float | None = Field(None, gt=0)   # host RAM MeshTrain may use for model state
+    remote_ram: RemoteRamConfig = RemoteRamConfig()
+    reuse: ReuseConfig = ReuseConfig()
+    prefetch: PrefetchConfig = PrefetchConfig()
 
     @model_validator(mode="after")
     def _check_residency(self):
         if self.use_remote_ram:
-            raise ValueError("memory.use_remote_ram: remote RAM tensor storage is not implemented yet")
+            self.remote_ram.enabled = True
+        if self.strategy == "remote_offload" and not self.remote_ram.enabled:
+            raise ValueError("memory.strategy remote_offload needs memory.remote_ram.enabled: true")
+        if self.remote_ram.enabled and self.strategy != "remote_offload":
+            raise ValueError("memory.remote_ram is used only with memory.strategy: remote_offload")
         if self.strategy != "static" and not self.use_local_ram:
             raise ValueError(f"memory.strategy {self.strategy} needs use_local_ram: true")
         if self.accelerator_budget is not None and self.accelerator_budget_mb is None:
@@ -236,7 +277,7 @@ class MeshTrainConfig(_Strict):
             n = self.model_num_layers()
             if self.placement.stages[0].layers[0] != 0 or self.placement.stages[-1].layers[1] != n:
                 raise ValueError(f"manual stages must cover layers [0, {n})")
-        if self.memory.optimizer_offload is True:
+        if self.memory.optimizer_offload is True or self.memory.strategy == "remote_offload":
             self.optimizer.execution = "cpu_offload"
         elif self.memory.optimizer_offload is False and self.optimizer.execution == "cpu_offload":
             raise ValueError("memory.optimizer_offload: false contradicts optimizer.execution: cpu_offload")
@@ -247,11 +288,29 @@ class MeshTrainConfig(_Strict):
         from meshtrain.runtime.offload import ResidencyPolicy
 
         m = self.memory
+        distance = m.prefetch.distance if m.prefetch.distance is not None else m.prefetch_distance
+        if not m.prefetch.enabled:
+            distance = 0
         return ResidencyPolicy(strategy=m.strategy, keep_resident=tuple(m.keep_resident),
-                               prefetch_distance=m.prefetch_distance, eviction=m.eviction,
+                               prefetch_distance=distance,
+                               remote_prefetch_distance=(0 if not m.prefetch.enabled else m.prefetch.remote_distance),
+                               eviction=m.eviction,
                                optimizer_execution=self.optimizer.execution, pin_host_memory=m.pin_host_memory,
                                enforce_allocator_limit=m.enforce_allocator_limit,
-                               budget_mb=m.accelerator_budget_mb, budget_spec=m.accelerator_budget)
+                               budget_mb=m.accelerator_budget_mb, budget_spec=m.accelerator_budget,
+                               local_ram_budget_mb=m.local_ram_budget_mb, reuse=m.reuse.enabled)
+
+    def remote_spec(self, job_id: str, address: str, worker: str = "", token: str | None = None):
+        """runtime.offload.RemoteSpec for the remote RAM worker at ``address`` (host:port)."""
+        from meshtrain.runtime.offload import RemoteSpec
+
+        r = self.memory.remote_ram
+        return RemoteSpec(address=address, worker=worker or address, token=token, job_id=job_id,
+                          budget_bytes=r.budget_bytes(), max_inflight_fetches=r.max_inflight_fetches,
+                          max_inflight_writebacks=r.max_inflight_writebacks, checksum=r.checksum,
+                          timeout_s=r.timeout_s,
+                          emulate_bandwidth_Bps=r.emulate_bandwidth_mbps * 1e6 / 8 if r.emulate_bandwidth_mbps else None,
+                          emulate_latency_s=r.emulate_latency_ms / 1000.0)
 
     def pipeline_settings(self, job_id: str, **overrides):
         """PipelineSettings for this config (shared by workers and local runs)."""

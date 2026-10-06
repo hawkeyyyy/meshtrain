@@ -7,6 +7,7 @@ tensors out.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import TYPE_CHECKING, Callable
 
@@ -55,7 +56,13 @@ class Stage:
         layer_offset: int = 0,
         residency: "ResidencyPolicy | None" = None,
         accelerator_budget: int | None = None,
+        layer_factory=None,
+        num_layers: int | None = None,
+        remote_client=None,
     ):
+        """``module=None`` + ``layer_factory(global_index, meta=False)`` + ``num_layers`` builds the
+        stage one layer at a time (each layer is placed -- device, RAM or remote -- before the next is
+        built), so a model larger than local RAM never exists in full on this machine (V2.5)."""
         self.device = device or CPUDeviceAdapter()
         self.stage_index = stage_index
         self.num_stages = num_stages
@@ -67,18 +74,37 @@ class Stage:
         if residency is not None and accelerator_budget is not None and residency.enforce_allocator_limit:
             self.device.limit_memory(accelerator_budget)
         offload = residency is not None and residency.active
+        remote_budget = residency.remote.budget_bytes if (residency is not None and residency.remote) else None
         self.tensor_store = LocalTensorStore(self.name, self.device.backend, device=self.device,
                                              compute_stage=stage_index, accelerator_budget=accelerator_budget,
-                                             offload=offload)
+                                             offload=offload,
+                                             local_ram_budget=residency.local_ram_budget if residency else None,
+                                             remote_budget=remote_budget)
+        if module is None and not offload:
+            module = nn.Sequential(*[layer_factory(layer_offset + i) for i in range(num_layers)])
         if offload:
-            from meshtrain.runtime.offload import ResidencyManager
+            from meshtrain.runtime.offload import ResidencyManager, connect_remote
 
-            for p in module.parameters():
-                if not self.device.supports_dtype(p.dtype):
-                    raise TypeError(f"{self.device.backend} does not support parameter dtype {p.dtype}")
-            self.module = module
-            self.residency = ResidencyManager(module, self.device, self.tensor_store, residency,
-                                              layer_offset=layer_offset, optimizer=optimizer)
+            if module is not None:
+                for p in module.parameters():
+                    if not self.device.supports_dtype(p.dtype):
+                        raise TypeError(f"{self.device.backend} does not support parameter dtype {p.dtype}")
+            if residency.strategy == "remote_offload" and remote_client is None:
+                remote_client = connect_remote(residency.remote)
+            try:
+                self.residency = ResidencyManager(module, self.device, self.tensor_store, residency,
+                                                  layer_offset=layer_offset, optimizer=optimizer,
+                                                  layer_factory=layer_factory, num_layers=num_layers,
+                                                  remote_client=remote_client)
+            except BaseException:
+                if remote_client is not None:
+                    try:
+                        remote_client.release()
+                    except Exception:
+                        pass
+                    remote_client.close()
+                raise
+            self.module = self.residency.module
         else:
             self.module = self.device.move_module(module)
         self.optimizer = build_optimizer(optimizer, self.module.parameters(), lr) if any(
@@ -239,6 +265,89 @@ class Stage:
         if self.residency is not None:
             self.residency.zero_grad()
 
+    def layer_major_step(self, xs, ys, loss_scale: float, timeline=None, step: int | None = None):
+        """One training step's forward + backward, layer by layer over all microbatches (V2.5 reuse).
+
+        Each layer runs its forward for every microbatch, then (in reverse) its backward for every
+        microbatch, with an explicit autograd boundary between layers. An offloaded layer is therefore
+        loaded once per pass instead of once per microbatch. Gradients accumulate in the same
+        microbatch order as the 1F1B single-stage schedule. Activations of all microbatches are kept
+        (the GPipe memory profile). Returns the per-microbatch losses.
+        """
+        if not (self.is_first and self.is_last):
+            raise BoundaryError("layer-major execution needs a single-stage pipeline")
+        dev, res = self.device, self.residency
+        layers = list(self.module)
+        param_ids = self._param_ids
+
+        def count(t):
+            return t
+
+        def pack(t):
+            ref = res.pack(t) if res is not None else None
+            return t if ref is None else ref
+
+        def unpack(obj):
+            return res.unpack(obj) if isinstance(obj, _ParamRef) else obj
+
+        prev = res.window_mode if res is not None else False
+        if res is not None:
+            res.window_mode = True
+        try:
+            t0 = time.perf_counter()
+            tl0 = timeline.now() if timeline is not None else None
+            acts = [dev.move_tensor(x) for x in xs]
+            graph = []
+            with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+                for li, layer in enumerate(layers):
+                    if res is not None:
+                        res.begin_window(layer)
+                    recs = []
+                    for x in acts:
+                        inp = x.detach().requires_grad_(True) if (li > 0 and x.is_floating_point()) else x
+                        recs.append((inp, layer(inp)))
+                    if res is not None:
+                        res.end_window(layer, "forward")
+                    acts = [o.detach() for _, o in recs]
+                    graph.append(recs)
+                self.device.sync_compute()
+                if timeline is not None:
+                    timeline.add("FORWARD_COMPUTE", tl0, timeline.now(), step, None, layer_major=True)
+                    tb0 = timeline.now()
+                losses, grads = [], []
+                last = layers[-1]
+                if res is not None:
+                    res.begin_window(last)
+                for (inp, out), y in zip(graph[-1], ys):
+                    loss = self.loss_fn(out, dev.move_tensor(y))
+                    (loss * loss_scale).backward()
+                    losses.append(loss.detach())
+                    grads.append(inp.grad if (len(layers) > 1 and inp.requires_grad) else None)
+                graph[-1] = None
+                if res is not None:
+                    res.end_window(last, "backward")
+                for li in range(len(layers) - 2, -1, -1):
+                    if res is not None:
+                        res.begin_window(layers[li])
+                    nxt = []
+                    for (inp, out), g in zip(graph[li], grads):
+                        out.backward(g)
+                        nxt.append(inp.grad if (li > 0 and inp.requires_grad) else None)
+                    graph[li] = None
+                    grads = nxt
+                    if res is not None:
+                        res.end_window(layers[li], "backward")
+            self._after_backward()
+            self.device.sync_compute()
+            if timeline is not None:
+                timeline.add("BACKWARD_COMPUTE", tb0, timeline.now(), step, None, layer_major=True)
+            self.last_step_compute_s = time.perf_counter() - t0
+            del param_ids, count
+            return losses
+        finally:
+            if res is not None:
+                res.window_mode = prev
+
     def _after_backward(self) -> None:
         if self.residency is not None:
             self.residency.after_backward_call()
@@ -263,10 +372,14 @@ class Stage:
         return out
 
     def named_parameters_cpu(self, prefix: str = "") -> dict[str, torch.Tensor]:
+        if self.residency is not None:   # remote layers are fetched from their authoritative copy
+            return {f"{prefix}{n}": self.residency.logical_value(p) for n, p in self.module.named_parameters()}
         return {f"{prefix}{n}": p.detach().cpu().clone() for n, p in self.module.named_parameters()}
 
     def memory_report(self) -> dict[str, int]:
-        params = sum(p.numel() * p.element_size() for p in self.module.parameters())
+        res = self.residency
+        params = sum((math.prod(res.by_param[id(p)][0].shapes[id(p)][0]) * p.element_size()) if res is not None
+                     else p.numel() * p.element_size() for p in self.module.parameters())
         grads = sum(g.numel() * g.element_size() for g in map(self._grad, self.module.parameters()) if g is not None)
         opt = 0
         if self.optimizer is not None:

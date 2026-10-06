@@ -38,7 +38,8 @@ def guess_advertise_host(coordinator_base: str) -> str:
 class WorkerAgent:
     def __init__(self, coordinator: str, token: str, *, device: str | None = None, name: str | None = None,
                  data_port: int = 29500, bind_host: str = "0.0.0.0", advertise_host: str | None = None,
-                 runs_dir: str = "runs", verbose: bool = True, quick_benchmark: bool = False):
+                 runs_dir: str = "runs", verbose: bool = True, quick_benchmark: bool = False,
+                 remote_ram_budget_mb: float = 0.0, remote_ram_reserve_system_gb: float = 4.0):
         self.client = ControlClient(coordinator, token)
         self.token = token
         self.device: DeviceAdapter = select_device(device)
@@ -48,7 +49,14 @@ class WorkerAgent:
         self.verbose = verbose
         self.runs_dir = runs_dir
         self.quick_benchmark = quick_benchmark
-        self.dataplane = DataPlaneServer(bind_host, data_port, token=token, logger=self.log).start()
+        self.tensor_server = None
+        if remote_ram_budget_mb and remote_ram_budget_mb > 0:
+            from meshtrain.networking.tensor_server import TensorServer
+
+            self.tensor_server = TensorServer(int(remote_ram_budget_mb * 1024**2), name=self.name,
+                                              reserve_system_bytes=int(remote_ram_reserve_system_gb * 1024**3))
+        self.dataplane = DataPlaneServer(bind_host, data_port, token=token, logger=self.log,
+                                         tensor_server=self.tensor_server).start()
         self.capabilities = self.device.capabilities()  # probes run once, at startup
         self.advertise_host = advertise_host or guess_advertise_host(self.client.base)
         self.worker_id: str | None = None
@@ -84,9 +92,15 @@ class WorkerAgent:
 
     def _memory(self) -> dict:
         try:
-            return {k: v for k, v in self.device.memory_stats().items() if isinstance(v, (int, bool))}
+            out = {k: v for k, v in self.device.memory_stats().items() if isinstance(v, (int, bool))}
         except Exception:
-            return {}
+            out = {}
+        if self.tensor_server is not None:
+            try:
+                out.update(self.tensor_server.advertisement())
+            except Exception:
+                pass
+        return out
 
     # -- command loop -----------------------------------------------------
     def run_forever(self) -> None:

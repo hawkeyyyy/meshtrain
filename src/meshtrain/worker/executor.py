@@ -38,8 +38,9 @@ from meshtrain.worker.device import DeviceAdapter
 
 class DataPlaneServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 29500, *, token: str | None = None,
-                 max_payload_bytes: int = 2 * 1024**3, logger: EventLogger | None = None):
+                 max_payload_bytes: int = 2 * 1024**3, logger: EventLogger | None = None, tensor_server=None):
         self.listener = TCPListener(host, port, token=token, max_payload_bytes=max_payload_bytes)
+        self.tensor_server = tensor_server   # V2.5: this worker lends RAM (networking/tensor_server.py)
         self.port = self.listener.port
         self.logger = logger
         self._pending: dict[tuple[str, int], TCPTransport] = {}
@@ -65,6 +66,12 @@ class DataPlaneServer:
                 continue
             if hello.get("command_kind") == "PROBE":
                 threading.Thread(target=self._probe, args=(link,), daemon=True).start()
+            elif hello.get("command_kind") == "TENSOR_STORE":
+                if self.tensor_server is None:
+                    link.close()   # this worker does not lend RAM
+                else:
+                    threading.Thread(target=self.tensor_server.handle, args=(link, self._stop), daemon=True,
+                                     name="tensor-store").start()
             elif "job_id" in hello and "stage" in hello:
                 with self._cond:
                     key = (str(hello["job_id"]), int(hello["stage"]))

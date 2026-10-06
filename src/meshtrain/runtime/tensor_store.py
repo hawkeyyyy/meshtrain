@@ -61,13 +61,13 @@ class MemoryTier(enum.Enum):
     RECOMPUTE = "recompute"                   # dropped, recomputed from an earlier checkpoint
 
 
-IMPLEMENTED_TIERS = frozenset({MemoryTier.LOCAL_ACCELERATOR, MemoryTier.LOCAL_RAM})
+IMPLEMENTED_TIERS = frozenset({MemoryTier.LOCAL_ACCELERATOR, MemoryTier.LOCAL_RAM, MemoryTier.REMOTE_RAM})
 
 
 def require_implemented(tier: MemoryTier) -> MemoryTier:
     if tier not in IMPLEMENTED_TIERS:
         raise NotImplementedError(f"memory tier {tier.value} is not implemented "
-                                  f"(V2 local-memory phase supports local_accelerator and local_ram only)")
+                                  f"(V2.5 supports local_accelerator, local_ram and remote_ram)")
     return tier
 
 
@@ -89,16 +89,18 @@ ROLE_ABBREV = {TensorRole.PARAMETER: "PARAM", TensorRole.GRADIENT: "GRAD", Tenso
 
 
 class MemoryBudgetError(MemoryError):
-    """A transfer would exceed the configured accelerator budget."""
+    """A transfer would exceed a configured budget (accelerator, local RAM or remote RAM)."""
 
     def __init__(self, tensor_id: str, source: MemoryTier | None, destination: MemoryTier, requested: int,
                  available: int, budget: int):
         self.tensor_id, self.source, self.destination = tensor_id, source, destination
         self.requested, self.available, self.budget = requested, available, budget
         src = source.value if source else "new allocation"
+        kind = {MemoryTier.LOCAL_ACCELERATOR: "accelerator", MemoryTier.LOCAL_RAM: "local RAM",
+                MemoryTier.REMOTE_RAM: "remote RAM"}.get(destination, destination.value)
         super().__init__(f"cannot place {tensor_id} ({src} -> {destination.value}): requested "
                          f"{requested / 1024**2:.1f} MB, available {available / 1024**2:.1f} MB "
-                         f"of a {budget / 1024**2:.1f} MB accelerator budget")
+                         f"of a {budget / 1024**2:.1f} MB {kind} budget")
 
 
 @dataclass
@@ -206,7 +208,8 @@ class LocalTensorStore(TensorStore):
     """
 
     def __init__(self, owner: str, device_type: str = "cpu", *, device=None, compute_stage: int | None = None,
-                 accelerator_budget: int | None = None, offload: bool = False):
+                 accelerator_budget: int | None = None, offload: bool = False, local_ram_budget: int | None = None,
+                 remote_budget: int | None = None):
         self.owner = owner
         self.device_type = device_type
         self.device = device                       # DeviceAdapter used for standalone moves (optional)
@@ -225,6 +228,11 @@ class LocalTensorStore(TensorStore):
         self.in_flight_peak = 0
         self.pinned_host_bytes = 0
         self.budget_violations = 0
+        # V2.5: local RAM and remote RAM ledgers
+        self.local_ram_budget = local_ram_budget
+        self.remote_budget = remote_budget
+        self.local_extra = 0          # staging/in-flight host bytes not (yet) represented by a record
+        self._local_peak = 0
 
     # -- accounting -------------------------------------------------------
     def _account(self, meta: TensorMeta, sign: int) -> None:
@@ -240,6 +248,10 @@ class LocalTensorStore(TensorStore):
         self._peak[MemoryTier.LOCAL_ACCELERATOR] = max(self._peak[MemoryTier.LOCAL_ACCELERATOR], acc)
         self._peak[MemoryTier.LOCAL_RAM] = max(self._peak[MemoryTier.LOCAL_RAM],
                                                self._tier_bytes.get(MemoryTier.LOCAL_RAM, 0))
+        self._peak[MemoryTier.REMOTE_RAM] = max(self._peak.get(MemoryTier.REMOTE_RAM, 0),
+                                                self._tier_bytes.get(MemoryTier.REMOTE_RAM, 0))
+        self._local_peak = max(getattr(self, "_local_peak", 0),
+                               self.local_resident_bytes() + getattr(self, "local_extra", 0))
 
     def accelerator_resident_bytes(self, budgeted_only: bool = True) -> int:
         tier = MemoryTier.LOCAL_ACCELERATOR
@@ -257,6 +269,47 @@ class LocalTensorStore(TensorStore):
             raise MemoryBudgetError(tensor_id, source, MemoryTier.LOCAL_ACCELERATOR, nbytes,
                                     max(0, self.accelerator_budget - used), self.accelerator_budget)
 
+    # -- local RAM ledger (V2.5) ------------------------------------------------
+    def local_resident_bytes(self) -> int:
+        return self._tier_bytes.get(MemoryTier.LOCAL_RAM, 0)
+
+    @property
+    def local_in_flight(self) -> int:
+        return self.local_extra
+
+    def reserve_local(self, nbytes: int, tensor_id: str, source: MemoryTier | None) -> None:
+        if self.local_ram_budget is None:
+            return
+        used = self.local_resident_bytes() + self.local_extra
+        if used + nbytes > self.local_ram_budget:
+            self.budget_violations += 1
+            raise MemoryBudgetError(tensor_id, source, MemoryTier.LOCAL_RAM, nbytes,
+                                    max(0, self.local_ram_budget - used), self.local_ram_budget)
+
+    def begin_local_transfer(self, nbytes: int) -> None:
+        self.add_local_extra(nbytes)
+
+    def end_local_transfer(self, nbytes: int) -> None:
+        self.release_local(nbytes)
+
+    def add_local_extra(self, nbytes: int) -> None:
+        with self._lock:
+            self.local_extra += nbytes
+            self._update_peaks()
+
+    def release_local(self, nbytes: int) -> None:
+        with self._lock:
+            self.local_extra = max(0, self.local_extra - nbytes)
+
+    def reserve_remote(self, nbytes: int, tensor_id: str) -> None:
+        if self.remote_budget is None:
+            return
+        used = self._tier_bytes.get(MemoryTier.REMOTE_RAM, 0)
+        if used + nbytes > self.remote_budget:
+            self.budget_violations += 1
+            raise MemoryBudgetError(tensor_id, MemoryTier.LOCAL_RAM, MemoryTier.REMOTE_RAM, nbytes,
+                                    max(0, self.remote_budget - used), self.remote_budget)
+
     def begin_transfer(self, nbytes: int) -> None:
         with self._lock:
             self.in_flight_bytes += nbytes
@@ -272,11 +325,16 @@ class LocalTensorStore(TensorStore):
             self._peak = {t: self._tier_bytes.get(t, 0) for t in IMPLEMENTED_TIERS}
             self._peak[MemoryTier.LOCAL_ACCELERATOR] = self.accelerator_resident_bytes() + self.in_flight_bytes
             self.in_flight_peak = self.in_flight_bytes
+            self._local_peak = self.local_resident_bytes() + self.local_extra
 
     # -- registration ---------------------------------------------------------
     def register(self, tensor_id, tensor, role, tier=None, **meta):
         """Track ``tensor`` (the store keeps a reference). Re-registering replaces the record."""
         tier = require_implemented(tier or self.home)
+        if tier == MemoryTier.REMOTE_RAM and tensor.device.type != "meta":
+            # The store cannot put bytes on another machine by itself: remote placement goes through
+            # the ResidencyManager, which registers shape-only (meta) records for remote tensors.
+            raise NotImplementedError("remote_ram placement is done by the ResidencyManager (parameter groups)")
         record = TensorMeta(tensor_id, self.owner, tuple(tensor.shape), str(tensor.dtype).replace("torch.", ""),
                             tensor_nbytes(tensor), role, tier, compute_stage=self.compute_stage, **meta)
         with self._lock:
@@ -334,9 +392,8 @@ class LocalTensorStore(TensorStore):
             require_implemented(t)
         with self._lock:
             meta = self.locate(tensor_id)
-            if meta.dirty and dirty is None and tier != MemoryTier.LOCAL_ACCELERATOR \
-                    and MemoryTier.LOCAL_ACCELERATOR not in cached:
-                raise RuntimeError(f"refusing to drop dirty accelerator copy of {tensor_id} without writeback")
+            if meta.dirty and dirty is None and meta.tier != tier and meta.tier not in cached:
+                raise RuntimeError(f"refusing to drop dirty {meta.tier.value} copy of {tensor_id} without writeback")
             self._account(meta, -1)
             meta.tier, meta.cached = tier, set(cached) - {tier}
             if dirty is not None:
@@ -349,17 +406,21 @@ class LocalTensorStore(TensorStore):
             self._account(meta, +1)
             return meta
 
-    def mark_dirty(self, tensor_id: str) -> TensorMeta:
-        """The accelerator copy was modified in place: it becomes authoritative and newer than RAM."""
+    def mark_dirty(self, tensor_id: str, tier: MemoryTier = MemoryTier.LOCAL_ACCELERATOR) -> TensorMeta:
+        """The copy in ``tier`` was modified: it becomes authoritative and newer than every slower copy.
+
+        ``dirty`` = a slower backing copy (RAM below the accelerator, REMOTE_RAM below local RAM)
+        exists and is now stale; it must be written back before the faster copy is dropped.
+        """
         with self._lock:
             meta = self.locate(tensor_id)
-            if MemoryTier.LOCAL_ACCELERATOR not in meta.resident_tiers():
-                raise RuntimeError(f"{tensor_id} has no accelerator copy to modify")
-            ram_copy = MemoryTier.LOCAL_RAM in meta.resident_tiers()
+            if tier not in meta.resident_tiers():
+                raise RuntimeError(f"{tensor_id} has no {tier.value} copy to modify")
+            backing = meta.resident_tiers() - {tier}
             self._account(meta, -1)
-            meta.tier = MemoryTier.LOCAL_ACCELERATOR
-            meta.cached = set()       # the RAM copy (if any) is stale; it stays allocated but invalid
-            meta.dirty = ram_copy
+            meta.tier = tier
+            meta.cached = set()       # every other copy is stale; it stays allocated but invalid
+            meta.dirty = bool(backing)
             meta.version += 1
             self._account(meta, +1)
             return meta
@@ -374,6 +435,8 @@ class LocalTensorStore(TensorStore):
             else:
                 self.manager.unload(meta.group, reason="store.move")
             return self.locate(tensor_id)
+        if to == MemoryTier.REMOTE_RAM or meta.tier == MemoryTier.REMOTE_RAM:
+            raise NotImplementedError("remote_ram holds parameter groups only (moved by the ResidencyManager)")
         if meta.tier == to and not meta.cached:
             return meta
         if meta.pinned and to != meta.tier:
@@ -452,6 +515,12 @@ class LocalTensorStore(TensorStore):
                 "temporary_bytes": role_bytes(TensorRole.TEMPORARY),
                 "accelerator_peak": self._peak[acc],
                 "ram_peak": self._peak[ram],
+                "local_ram_budget": self.local_ram_budget,
+                "local_resident": self.local_resident_bytes() + self.local_extra,
+                "local_peak": self._local_peak,
+                "remote_resident": self._tier_bytes.get(MemoryTier.REMOTE_RAM, 0),
+                "remote_peak": self._peak.get(MemoryTier.REMOTE_RAM, 0),
+                "remote_budget": self.remote_budget,
                 "requested_budget": self.accelerator_budget,
                 "headroom": (self.accelerator_budget - self._peak[acc]) if self.accelerator_budget else None,
                 "budget_violations": self.budget_violations,

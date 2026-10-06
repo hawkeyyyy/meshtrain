@@ -45,7 +45,7 @@ def test_register_metadata_and_tier_totals():
                                                                                          "w", 2)
     assert not m.dirty and not m.pinned and m.version == 0 and m.current_location == ACC
     store.register("x", torch.zeros(4), TensorRole.OPTIMIZER_STATE, RAM)
-    assert store.bytes_by_tier() == {"local_accelerator": 128, "local_ram": 16}
+    assert store.bytes_by_tier() == {"local_accelerator": 128, "local_ram": 16, "remote_ram": 0}
     st = store.stats()
     assert st["accelerator_resident"] == 128 and st["ram_resident"] == 16 and st["optimizer_bytes"] == 16
     again = store.register("model.layers.4.qkv.weight", torch.zeros(8, 4), TensorRole.PARAMETER)
@@ -64,11 +64,13 @@ def test_static_stage_tracks_all_parameters_on_accelerator_tier():
 def test_unimplemented_tiers_raise():
     store = LocalTensorStore("w", "cuda")
     store.register("t", torch.zeros(2), TensorRole.PARAMETER)
-    for tier in (MemoryTier.REMOTE_RAM, MemoryTier.REMOTE_ACCELERATOR, MemoryTier.LOCAL_NVME, MemoryTier.RECOMPUTE):
+    for tier in (MemoryTier.REMOTE_ACCELERATOR, MemoryTier.LOCAL_NVME, MemoryTier.RECOMPUTE):
         with pytest.raises(NotImplementedError):
             store.move("t", tier)
         with pytest.raises(NotImplementedError):
             store.set_residency("t", tier)
+    with pytest.raises(NotImplementedError, match="parameter groups only"):
+        store.move("t", MemoryTier.REMOTE_RAM)   # V2.5: remote_ram exists, but only for parameter groups
 
 
 def test_standalone_move_and_dirty_writeback_rules():
@@ -98,8 +100,8 @@ def test_config_strategies_and_budget_parsing():
     assert parse_config({"model": {"type": "mlp"}, "memory": {"accelerator_budget_mb": 2048}}).memory.budget_bytes() \
         == 2048 * 1024**2
     assert not parse_config({"model": {"type": "mlp"}}).residency_policy().active  # default = V1.5
-    with pytest.raises(ConfigError, match="remote RAM"):
-        parse_config({"model": {"type": "mlp"}, "memory": {"use_remote_ram": True}})
+    with pytest.raises(ConfigError, match="remote_offload"):
+        parse_config({"model": {"type": "mlp"}, "memory": {"use_remote_ram": True}})   # needs the strategy
 
 
 # -- ResidencyManager (V2.1+) ----------------------------------------------------

@@ -34,7 +34,19 @@ def _named(stage):
 def save_stage_checkpoint(stage, path: str | Path, step: int | None = None) -> Path:
     res = stage.residency
     params, optim = {}, {}
+    remote_values = {}
+    if res is not None:   # remote layers: fetch the committed params + AdamW state (V2.5)
+        for g in res.remote_groups:
+            remote_values.update(res.fetch_logical(g))
     for tid, p in _named(stage):
+        if tid in remote_values:
+            params[tid] = remote_values[tid]
+            st = {k: remote_values[f"{tid}.optim.{k}"] for k in ("exp_avg", "exp_avg_sq")
+                  if f"{tid}.optim.{k}" in remote_values}
+            step = (stage.optimizer.state.get(p, {}) if stage.optimizer is not None else {}).get("step")
+            if st:
+                optim[tid] = {**st, **({"step": step.detach().clone()} if torch.is_tensor(step) else {})}
+            continue
         if res is not None:
             g = res.by_param[id(p)][0]
             meta = stage.tensor_store.locate(tid)
@@ -67,7 +79,22 @@ def load_stage_checkpoint(stage, path: str | Path) -> dict:
         raise KeyError(f"checkpoint lacks {len(missing)} tensors, e.g. {sorted(missing)[:3]}")
     cpu_opt = res is not None and res.cpu_opt
     with torch.no_grad():
+        if res is not None:   # remote layers: write the checkpoint values as new committed versions
+            for g in res.remote_groups:
+                vals = {}
+                for tid, p in g.params:
+                    vals[tid] = ckpt["parameters"][tid]
+                    st = ckpt["optimizer"].get(tid) or {}
+                    for k in ("exp_avg", "exp_avg_sq"):
+                        if k in st:
+                            vals[f"{tid}.optim.{k}"] = st[k]
+                    if "step" in st and stage.optimizer is not None:
+                        stage.optimizer.state[p] = {"step": st["step"]}
+                res.store_logical(g, vals)
+        remote_ids = {tid for g in (res.remote_groups if res is not None else []) for tid, _ in g.params}
         for tid, p in named.items():
+            if tid in remote_ids:
+                continue
             value = ckpt["parameters"][tid]
             if value.shape != p.shape or value.dtype != p.dtype:
                 raise ValueError(f"{tid}: checkpoint {tuple(value.shape)} {value.dtype} vs model "

@@ -311,6 +311,7 @@ def run_stage(
             if stage.residency is not None:
                 stage.residency.step_begin(step)
             sm = StageStateMachine(sidx, S, M, step, settings.schedule, settings.max_inflight_microbatches)
+            layer_major = (stage.residency is not None and stage.residency.policy.reuse and S == 1)
             st.update(sm=sm, bufs=_StepBuffers(), step=step, bytes_received=st.get("bytes_received", 0))
             bytes_recv0, sent0 = st["bytes_received"], dict(outbox.bytes_sent)
             for link, packet, tensor in future.pop(step, []):
@@ -322,7 +323,13 @@ def run_stage(
             peak_saved_bytes = peak_saved_mbs = 0
             bufs = st["bufs"]
 
-            while not sm.done:
+            if layer_major:   # V2.5 reuse: each offloaded layer loaded once per pass for all microbatches
+                x, y = spec.make_batch(step, settings.batch_size)
+                losses_mb = stage.layer_major_step(list(x.chunk(M)), list(y.chunk(M)), 1.0 / M, timeline=tl,
+                                                   step=step)
+                loss_sum = float(sum(float(l) for l in losses_mb))
+                sm = None
+            while sm is not None and not sm.done:
                 action = sm.next_action()
                 mb = action.microbatch
                 wait_until_ready(action, step)
@@ -372,7 +379,7 @@ def run_stage(
                         logger.log("BACKWARD_COMPLETE", step, mb, compute_s=ctx.timings["backward"])
                 sm.advance()
 
-            if not sm.all_complete():
+            if sm is not None and not sm.all_complete():
                 raise fail_dump("schedule finished with incomplete microbatches")
             if settings.capture_gradients_at_step == step:
                 result.gradients = stage.named_gradients()
@@ -419,7 +426,8 @@ def run_stage(
                 "lifecycle": {k: v for k, v in phase.items() if not k.startswith("WAIT")},
                 "outbound_queue_peak": max(outbox.peak_depth.values(), default=0),
                 "inbound_queue_peak": inbox.peak_depth if inbox else 0,
-                "peak_inflight_microbatches": sm.peak_inflight,
+                "peak_inflight_microbatches": sm.peak_inflight if sm is not None else M,
+                "layer_major": sm is None,
                 "buffer_pool": dev.host_pool.stats(),
                 "utilization": m["compute_s"] / step_s if step_s else 0.0,
                 "memory": {**mem, "device_allocated": dev_mem.get("allocated", 0),
