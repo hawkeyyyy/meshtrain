@@ -745,7 +745,13 @@ def cmd_tensor_server(args) -> int:
 
 
 def remote_workers(status: dict) -> list[dict]:
-    return [w for w in status.get("workers", []) if (w.get("memory") or {}).get("remote_ram_budget")]
+    out = []
+    for w in status.get("workers", []):
+        if not (w.get("memory") or {}).get("remote_ram_budget"):
+            continue
+        host, _, port = str(w.get("data_address", "")).rpartition(":")
+        out.append({**w, "data_host": w.get("data_host") or host, "data_port": w.get("data_port") or port})
+    return out
 
 
 def format_remote_status(workers: list[dict], probes: dict | None = None) -> str:
@@ -757,6 +763,8 @@ def format_remote_status(workers: list[dict], probes: dict | None = None) -> str
         m = w.get("memory") or {}
         free = max(0, m.get("remote_ram_budget", 0) - m.get("remote_ram_reserved", 0))
         pr = probes.get(w["worker_id"]) or {}
+        if m.get("ram_available") is not None and m.get("remote_ram_reserve_system") is not None:
+            free = min(free, max(0, m["ram_available"] - m["remote_ram_reserve_system"]))   # what it would accept now
         rows.append([w["worker_id"], gb(m.get("ram_total")), gb(m.get("remote_ram_reserve_system")),
                      gb(m.get("remote_ram_budget")), gb(m.get("remote_ram_used")), gb(free),
                      f"{pr['rtt_s'] * 1000:.1f} ms" if pr.get("rtt_s") else "-",
@@ -789,6 +797,9 @@ def cmd_remote_status(args) -> int:
             except Exception as exc:
                 probes[w["worker_id"]] = {"error": str(exc)}
     print(format_remote_status(workers, probes))
+    for wid, pr in probes.items():
+        if pr.get("error"):
+            print(paint(f"probe {wid}: {pr['error']}", "bad"))
     return 0
 
 
