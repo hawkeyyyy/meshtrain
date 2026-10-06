@@ -82,8 +82,8 @@ def _trial(model_cfg: dict, strategy: str, device: str, budget: int | None, step
 
         client = connect_remote(policy.remote)
         if network_Bps is None:   # measure the real link (sustained large tensors), do not assume
-            pr = client.probe(pings=5, payload_mb=16)
-            network_Bps, kw["_rtt"] = pr["bandwidth_Bps"] / 2, pr["rtt_s"]   # one direction
+            pr = client.probe(pings=5, payload_mb=32)
+            network_Bps, kw["_rtt"] = pr["bandwidth_Bps"], pr["rtt_s"]   # probe reports the one-way link rate
     out = {"strategy": strategy, "policy": kw, "model": model_cfg, "device": device, "budget": budget,
            "batch": batch, "microbatches": batch // micro, "steps": steps}
     proc = psutil.Process()

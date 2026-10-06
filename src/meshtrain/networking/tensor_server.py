@@ -535,7 +535,10 @@ class RemoteTensorClient:
         threading.Thread(target=loop, daemon=True, name=f"remote-hb-{self.worker}").start()
 
     def probe(self, *, pings: int = 5, payload_mb: float = 32.0) -> dict:
-        """RTT (small PINGs) and sustained large-tensor bandwidth both ways."""
+        """RTT (small PINGs) and sustained large-tensor bandwidth.
+
+        One echo of ``payload_mb``: upload then download, sequentially, so
+        ``bandwidth_Bps = 2 * payload / (round trip - rtt)`` is the one-way link rate."""
         import torch
 
         rtts = []
