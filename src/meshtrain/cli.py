@@ -27,10 +27,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 
 import yaml
+
+from meshtrain.terminal import banner, enable_windows_color, heading, paint, table, tools_help
 
 DEFAULT_TOKEN = "meshtrain-dev-token"
 DEFAULT_PORT = 8080
@@ -88,8 +91,8 @@ def lan_ip() -> str:
         return socket.gethostbyname(socket.gethostname())
 
 
-def _token(args) -> str:
-    tok = args.token or os.environ.get("MESHTRAIN_TOKEN") or load_saved().get("token")
+def _token(args=None) -> str:
+    tok = getattr(args, "token", None) or os.environ.get("MESHTRAIN_TOKEN") or load_saved().get("token")
     if not tok:
         print(f"warning: no --token / $MESHTRAIN_TOKEN given, using the insecure default {DEFAULT_TOKEN!r}",
               file=sys.stderr)
@@ -97,10 +100,10 @@ def _token(args) -> str:
     return tok
 
 
-def _client(args):
+def _client(args=None):
     from meshtrain.networking.control import ControlClient
 
-    address = (args.coordinator or os.environ.get("MESHTRAIN_COORDINATOR") or load_saved().get("coordinator")
+    address = (getattr(args, "coordinator", None) or os.environ.get("MESHTRAIN_COORDINATOR") or load_saved().get("coordinator")
                or f"127.0.0.1:{DEFAULT_PORT}")
     return ControlClient(address, _token(args))
 
@@ -153,6 +156,7 @@ def cmd_start(args) -> int:
 
     from meshtrain.networking.control import ControlClient, ControlError
 
+    print(banner() + "\n", flush=True)
     alphabet = "abcdefghjkmnpqrstuvwxyz23456789"  # no look-alikes, never starts with "-"
     token = (args.token or os.environ.get("MESHTRAIN_TOKEN")
              or "".join(secrets.choice(alphabet) for _ in range(10)))
@@ -174,10 +178,10 @@ def cmd_start(args) -> int:
     host = args.advertise_host or lan_ip()
     args.advertise_host = host  # remote stages must dial this machine's LAN address, not 127.0.0.1
     port_part = "" if args.port == DEFAULT_PORT else f":{args.port}"
-    print(f"\nMeshTrain cluster started.\n\n  On every other machine run:\n\n"
+    print(f"\n{heading('MeshTrain cluster started')}\n\n  {paint('On every other machine run:', 'accent')}\n\n"
           f"      meshtrain join {token}@{host}{port_part}\n\n"
           f"  Then, on any machine in the cluster:\n"
-          f"      meshtrain status\n      meshtrain train configs/local_cpu.yaml\n", flush=True)
+          f"      meshtrain console\n      meshtrain dashboard\n      meshtrain train configs/local_cpu.yaml\n", flush=True)
     try:
         if args.no_worker:
             coord.wait()
@@ -195,29 +199,86 @@ def cmd_start(args) -> int:
 
 # -- cluster -----------------------------------------------------------------
 def format_status(status: dict) -> str:
-    lines = ["MeshTrain Cluster", "",
-             f"{'ID':<20}{'Backend':<9}{'Device':<26}{'Memory':<12}{'RAM':<10}{'Score':<7}{'Status':<8}",
-             "-" * 92]
+    workers = status["workers"]
+    online = sum(w["status"] in ("ONLINE", "BUSY") for w in workers)
+    lines = [heading("MeshTrain Cluster", f"{online}/{len(workers)} workers online"), ""]
+    rows = []
     unified = False
-    for w in status["workers"]:
+    for w in workers:
         dev = w.get("device") or {}
         mem = _gb(dev.get("memory_total")) if w["backend"] != "cpu" else "-"
         if dev.get("unified_memory"):
             mem += "*"
             unified = True
         score = (w.get("benchmark") or {}).get("compute_score")
-        lines.append(f"{w['worker_id'][:19]:<20}{w['backend'].upper():<9}{str(dev.get('name', ''))[:25]:<26}"
-                     f"{mem:<12}{_gb(w.get('ram_total')):<10}{(f'{score:.2f}' if score is not None else '-'):<7}"
-                     f"{w['status']:<8}" + (f" job={w['current_job']}" if w.get("current_job") else ""))
+        rows.append([w['worker_id'], w['backend'].upper(), str(dev.get('name', '')), mem,
+                     _gb(w.get('ram_total')), f'{score:.2f}' if score is not None else '-', w['status']])
+    if shutil.get_terminal_size((110, 24)).columns >= 100:
+        lines.append(table(["WORKER", "BACKEND", "DEVICE", "MEMORY", "RAM", "SCORE", "STATUS"],
+                           rows, [16, 7, 25, 11, 9, 6, 9]))
+    else:
+        lines.append(table(["WORKER", "BACKEND", "DEVICE", "STATUS"],
+                           [[r[0], r[1], r[2], r[6]] for r in rows], [16, 7, 26, 9]))
+        lines += [paint(f"  {r[0]}: device memory {r[3]} | RAM {r[4]} | score {r[5]}", "dim") for r in rows]
+    if not workers:
+        lines.append(paint("No workers yet. Run meshtrain join CODE on another machine.", "dim"))
+    for w in workers:
+        if w.get("current_job"):
+            lines.append(f"  {w['worker_id']} -> {paint(w['current_job'], 'warn')}")
     if unified:
-        lines += ["", "* unified memory"]
+        lines += ["", paint("* unified memory", "dim")]
     if status.get("jobs"):
-        lines += ["", "Jobs:"] + [f"  {j['job_id']}  {j['status']}" for j in status["jobs"]]
+        lines += ["", heading("Jobs")] + [f"  {j['job_id']}  {paint(j['status'], 'good' if j['status'] == 'COMPLETED' else 'dim')}" for j in status["jobs"]]
+    lines += ["", paint("jobs: metrics  |  dashboard: charts  |  console: tools", "dim")]
     return "\n".join(lines)
 
 
 def cmd_cluster_status(args) -> int:
-    print(format_status(_client(args).status()))
+    client = _client(args)
+    with client.http:
+        print(format_status(client.status()))
+        print(paint(f"Coordinator: {client.base}", "dim"))
+    return 0
+
+
+def format_jobs(jobs: list[dict]) -> str:
+    rows = []
+    for job in sorted(jobs, key=lambda j: j.get("created_at", 0), reverse=True):
+        losses = dict(job.get("losses", []))
+        metrics = job.get("last_metrics", {})
+        first = metrics[min(metrics, key=int)] if metrics else {}
+        step_s = first.get("step_s", (job.get("summary") or {}).get("mean_step_s"))
+        rows.append([job["job_id"], job["status"], str(len(losses)),
+                     f"{losses[max(losses)]:.5g}" if losses else "-", f"{step_s * 1000:.1f}" if step_s is not None else "-"])
+    lines = [heading("Training runs", f"{len(jobs)} recorded"), "",
+             table(["RUN", "STATUS", "STEPS", "LOSS", "STEP ms"], rows, [32, 10, 6, 10, 10])]
+    if not jobs:
+        lines.append(paint("No runs yet. Start one with meshtrain train CONFIG.", "dim"))
+    for job in jobs:
+        if job.get("error"):
+            lines.append(paint(f"  {job['job_id']}: {job['error']}", "bad"))
+    lines += ["", paint("Latest first-stage timing. Use dashboard for loss history.", "dim")]
+    return "\n".join(lines)
+
+
+def cmd_jobs(args) -> int:
+    client = _client(args)
+    with client.http:
+        print(format_jobs(client.jobs()["jobs"]))
+    return 0
+
+
+def cmd_console(args) -> int:
+    from meshtrain.terminal import run_console
+
+    run_console(args)
+    return 0
+
+
+def cmd_dashboard(args) -> int:
+    from meshtrain.dashboard import run_dashboard
+
+    run_dashboard(_client(args), args.port)
     return 0
 
 
@@ -254,29 +315,31 @@ def cmd_benchmark(args) -> int:
 def format_benchmark(b: dict) -> str:
     from meshtrain.profiler.network import format_matrix
 
-    lines = [f"Benchmark status: {b.get('status')}", "",
-             f"{'worker':<20}{'backend':<8}{'matmul GFLOP/s':>16}{'mlp fwd ms':>12}{'mlp bwd ms':>12}{'score':>8}"]
+    lines = [heading("Cluster benchmark", f"status: {b.get('status')}"), ""]
+    rows = []
     for wid, r in sorted(b.get("workers", {}).items(), key=lambda kv: -kv[1]["compute_score"]):
-        lines.append(f"{wid[:19]:<20}{r['backend']:<8}{r['matmul_gflops']:>16.1f}{r['mlp_forward_s'] * 1000:>12.2f}"
-                     f"{r['mlp_backward_s'] * 1000:>12.2f}{r['compute_score']:>8.2f}")
+        rows.append([wid, r['backend'].upper(), f"{r['matmul_gflops']:.1f}", f"{r['mlp_forward_s'] * 1000:.2f}",
+                     f"{r['mlp_backward_s'] * 1000:.2f}", f"{r['compute_score']:.2f}"])
+    lines.append(table(["WORKER", "BACKEND", "MATMUL GFLOP/s", "FWD ms", "BWD ms", "SCORE"],
+                       rows, [16, 7, 14, 12, 12, 7]))
     names = sorted(b.get("workers", {}))
     links = {tuple(k.split("->")): v for k, v in b.get("links", {}).items()}
     if names and links:
-        lines += ["", "Bandwidth (row -> column):",
+        lines += ["", heading("Bandwidth", "row -> column"),
                   format_matrix(names, {k: v["bandwidth_Mbps"] for k, v in links.items()},
                                 lambda v: "?" if v is None else f"{v:.0f}Mbps"),
-                  "", "Latency (row -> column):",
+                  "", heading("Latency", "row -> column"),
                   format_matrix(names, {k: v["latency_s"] for k, v in links.items()},
                                 lambda v: "?" if v is None else f"{v * 1000:.2f}ms")]
     for e in b.get("errors", []):
-        lines.append(f"error: {e}")
+        lines.append(paint(f"error: {e}", "bad"))
     return "\n".join(lines)
 
 
 def cmd_cluster_benchmark(args) -> int:
     c = _client(args)
     c.start_benchmark(pings=args.pings, payload_mb=args.payload_mb, network=not args.no_network)
-    print("benchmarking cluster (compute + worker-to-worker network)...", flush=True)
+    print(heading("Benchmarking cluster", "compute + worker-to-worker network"), flush=True)
     while True:
         b = c.benchmark()
         if b.get("status") != "RUNNING":
@@ -319,7 +382,7 @@ def cmd_train(args) -> int:
         return _train_local(args)
     c = _client(args)
     raw = _load_raw(args.config)
-    print("planning model...", flush=True)
+    print(heading("Planning training", args.config), flush=True)
     job = c.start_job(raw)
     print(job["plan_text"])
     for s in job["plan"]["stages"]:
@@ -344,7 +407,7 @@ def cmd_train(args) -> int:
         print("stopping job...")
         c.stop_job(job["job_id"])
         return 130
-    print(f"\njob {j['status']}" + (f": {j['error']}" if j.get("error") else ""))
+    print("\n" + heading("Training " + j['status']) + (paint(f": {j['error']}", "bad") if j.get("error") else ""))
     if j.get("summary"):
         from meshtrain.summary import format_summary
 
@@ -450,11 +513,13 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--token", default=argparse.SUPPRESS, help="cluster token (default $MESHTRAIN_TOKEN)")
     common.add_argument("--coordinator", default=argparse.SUPPRESS,
                         help="coordinator HOST:PORT (default $MESHTRAIN_COORDINATOR or 127.0.0.1:8080)")
-    p = argparse.ArgumentParser(prog="meshtrain", description="Heterogeneous pipeline-parallel training (V1)")
+    p = argparse.ArgumentParser(prog="meshtrain", description=heading("MeshTrain", "Heterogeneous pipeline training"),
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=tools_help() + "\n\nRun meshtrain console for an interactive command prompt.")
     # Separate actions (not parents=[common]): set_defaults would mutate the shared actions.
     p.add_argument("--token", default=None, help="cluster token (default $MESHTRAIN_TOKEN)")
     p.add_argument("--coordinator", default=None, help="coordinator HOST:PORT")
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=True, title="tools", metavar="COMMAND")
 
     co = sub.add_parser("coordinator").add_subparsers(dest="action", required=True)
     s = co.add_parser("start", parents=[common])
@@ -487,6 +552,12 @@ def build_parser() -> argparse.ArgumentParser:
     jn.set_defaults(func=cmd_worker_join)
 
     sub.add_parser("status", parents=[common], help="show cluster workers").set_defaults(func=cmd_cluster_status)
+    sub.add_parser("jobs", parents=[common], help="show training status, loss, and step timings").set_defaults(func=cmd_jobs)
+    sub.add_parser("console", parents=[common], help="open the interactive tools and command prompt").set_defaults(func=cmd_console)
+
+    dashboard = sub.add_parser("dashboard", parents=[common], help="view live training metrics in a local browser")
+    dashboard.add_argument("--port", type=int, default=8081, help="local dashboard port (default: 8081)")
+    dashboard.set_defaults(func=cmd_dashboard)
 
     wo = sub.add_parser("worker").add_subparsers(dest="action", required=True)
     j = wo.add_parser("join", parents=[common])
@@ -518,7 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--cluster", action="store_true", help="pipeline: run the modes as jobs on the real cluster")
     b.set_defaults(func=cmd_benchmark)
 
-    pl = sub.add_parser("plan", parents=[common])
+    pl = sub.add_parser("plan", parents=[common], help="preview model placement")
     pl.add_argument("config")
     pl.set_defaults(func=cmd_plan)
 
@@ -527,7 +598,7 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("config")
     ip.set_defaults(func=cmd_inspect_placement)
 
-    t = sub.add_parser("train", parents=[common])
+    t = sub.add_parser("train", parents=[common], help="train a model from a YAML config")
     t.add_argument("config")
     t.add_argument("--local", action="store_true", help="run every stage as a local process")
     t.add_argument("--stages", type=int, help="--local: number of equal stages if the config has none")
@@ -542,7 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--reference-steps", type=int, default=20)
     rr.set_defaults(func=cmd_results_record)
 
-    e = sub.add_parser("experiment", parents=[common])
+    e = sub.add_parser("experiment", parents=[common],
+                       help="run correctness, placement, capacity, or device experiments")
     e.add_argument("name", choices=["correctness", "placement", "capacity", "transformer", "device-correctness"])
     e.add_argument("--devices", default="cpu,cpu", help="device-correctness: one device per stage, e.g. cuda,cuda,mps")
     e.add_argument("--transport", default="tcp", choices=["pipe", "tcp"])
@@ -555,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    enable_windows_color()
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
@@ -563,7 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         from meshtrain.networking.control import ControlError
 
         if isinstance(exc, (ControlError, ConfigError, FileNotFoundError)):
-            print(f"error: {exc}", file=sys.stderr)
+            print(paint(f"error: {exc}", "bad"), file=sys.stderr)
             return 2
         raise
 

@@ -13,8 +13,9 @@ unless the section's environment line says so.
 | Do distributed gradients equal single-process gradients? | Yes on CPU: MLP exactly (0 error), Transformer to ~1e-7 relative | Experiment 1 (pipe and TCP), test suite |
 | Does distributed training follow the single-process trajectory? | Yes on CPU (loss curves agree to ~1e-7) | Milestone 8, cluster demo |
 | Do all stages update and does the loss decrease? | Yes (2 and 3 stages, MLP and Transformer) | tests, Milestone 8, cluster demo |
-| CUDA → CUDA, CUDA → CUDA → MPS | **Not measured**: no physical CUDA/MPS hardware was available | Experiments 2 and 3 (pending) |
-| Capacity gain (primary metric) | 2.59x **in emulation** (scaled-down budgets, CPU processes); unmeasured on real devices | Experiment 5 |
+| CUDA → CUDA | **Measured**: 396M and 475M models completed five steps on RTX 4070 Laptop → GTX 1050 Ti over a physical LAN | Hardware comparison, 2026-10-06 |
+| CUDA → CUDA → MPS | **Not measured** | Experiment 3 (pending) |
+| Capacity gain (primary metric) | 2.59x **in emulation**; 1.00x for the tested physical sizes with the current driver settings; dedicated-VRAM-only gain unproven | Experiment 5 and hardware comparison |
 | Does the cost model rank placements correctly? | Not reliably: on the emulated workers the measured ranking differed from the prediction | Experiment 4 |
 
 ## Experiment 1 — correctness (single process vs. distributed CPU stages)
@@ -141,8 +142,108 @@ _5 steps per run; loss changes over so few steps are not a convergence result. R
 ### Physical hardware
 
 <!-- BEGIN:experiment5-hardware -->
-_not yet run — requires the physical CUDA/MPS cluster (`meshtrain experiment capacity --mode hardware`)._
+_Generated 2026-10-05 23:38 on hawkey (Windows AMD64, torch 2.6.0+cu124, CUDA available: True, MPS available: False)._
+
+**Mode: hardware** (real devices via the coordinator).
+
+| device | P_max | steps/s at P_max | first failure |
+|---|---|---|---|
+| hawkey | 475.0M | 0.117 | stage 0 on hawkey: RuntimeError: CUDA error: out of memory CUDA kernel errors might be asynchronously reported at some o |
+| server | 0.0M | 0.000 | stage 0 on server: OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 MiB. GPU 0 has a total capacity of 3.94 |
+| MeshTrain | 396.3M | 0.144 | stage 1 on server: OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 3.94 |
+
+capacity_gain = 0.83x, throughput penalty = 0.82x
 <!-- END:experiment5-hardware -->
+
+### Hardware evidence review (2026-10-05, before the corrected comparison)
+
+The generated table above predates the planner correction. Its "MeshTrain" row does not establish
+that the successful model was split across multiple GPUs: the old hardware experiment let `auto`
+choose a single worker. The saved artifacts show:
+
+- `capacity-20261005-233740-04d2`: 396.3M parameters, three completed steps, one CUDA stage on
+  `hawkey`, all layers `[0, 22)`. No server stage or network boundary was used.
+- `capacity-20261005-233804-9b96`: laptop alone completed three steps at 475.0M parameters;
+  recorded peak torch allocation was 9.10 GiB against 8.00 GiB device capacity. This is not a
+  dedicated-VRAM-only baseline. The artifacts do not record the NVIDIA Sysmem Fallback setting.
+- `capacity-20261005-233833-8720`: the 475.0M attempt used `hawkey` layers `[0, 15)` and
+  `server` layers `[15, 26)`, but did not complete. The generated report records an OOM on the server.
+- `capacity-20261005-233343-70ba`: the earlier server-only sweep completed 143.4M parameters
+  in three steps. The later sweep started at 203.7M and failed on the server immediately; its
+  reported `0.0M` means no success in that sweep, not that the server has zero capacity.
+
+These trials do **not** demonstrate a completed 396.3M pipeline across both GPUs or a model
+larger than either device can train alone. The old estimate counted parameters, gradients and
+AdamW state, but omitted CUDA foreach optimizer intermediates (approximately another parameter
+set). The corrected planner includes that workspace and caps budgets using reported free VRAM
+plus unused allocator cache. Hardware capacity trials now request one stage per online worker
+and report the actual stage count at the largest successful tested size.
+
+With the recorded GPU totals and benchmark rates, a corrected dry plan places the 475.0M model
+on `hawkey` layers `[0, 17)` and `server` layers `[17, 26)`: estimated requirements are
+6.71 / 6.80 GiB and 3.06 / 3.35 GiB respectively. The old server allocation now estimates
+3.82 GiB, exceeding its 3.35 GiB budget. The 553.7M candidate has no feasible partition at
+the default headroom. These dry plans assume available memory does not further reduce either
+budget; live heartbeats may lower them. The V1.5 estimator (CUDA safety factor 0.85, 0.4 GB
+framework reserve) is more conservative and rejects this split: it estimates 3.07 GiB on `server`
+against a 2.95 GiB usable budget.
+
+New plans remain estimates, not measured training results. A fair capacity comparison needs
+fresh single-device and multi-device runs with the same model, dtype, optimizer and batch settings,
+with the laptop's dedicated-VRAM-only configuration verified. Aggregate VRAM does not by itself
+guarantee a 550–600M model will fit, because optimizer workspace, activations, headroom and
+indivisible layer sizes also constrain the partition.
+
+## Corrected hardware comparison — 2026-10-06
+
+Laptop: Windows AMD64, Python 3.12, torch 2.6.0+cu124, RTX 4070 Laptop GPU with 7.996 GiB.
+Server: a separate machine on the LAN with GTX 1050 Ti, 3.937 GiB; remote torch version was
+not reported. All runs used CUDA. The server-only trials started late on 2026-10-05; the
+large comparisons completed on 2026-10-06 (Asia/Katmandu).
+
+Five steps per trial: FP32 tiny Transformer, vocab 1024, sequence length 64, eight attention
+heads, AdamW at 3e-4, batch 8 as four microbatches of 2. The large comparisons restarted the
+laptop worker between trials. The corrected auto planner forced two stages for mesh runs.
+Rates exclude the first warmup step and initialization. GPU peaks below are recorded
+per-process CUDA allocation peaks, not measurements of dedicated versus shared residency.
+
+| Target | Parameters | Steps | Steps/s | GPU allocation peaks (GiB) | Run |
+|---|---|---|---|---|---|
+| Server alone | 153.3M | 5 | 0.782 | server: 2.87 | `capacity-20261005-235818-d450` |
+| Laptop alone | 396.3M | 5 | 0.026 | laptop: 7.60 | `capacity-cold-20261006-000710-56aa` |
+| Laptop alone | 475.0M | 5 | 0.122 | laptop: 9.10 | `capacity-cold-20261006-001035-0628` |
+| Both GPUs | 396.3M | 5 | 0.626 | laptop: 4.56, server: 3.66 | `capacity-cold-20261006-001951-8e7c` |
+| Both GPUs | 475.0M | 5 | 0.615 | laptop: 6.07, server: 3.66 | `capacity-cold-20261006-001608-615c` |
+
+The 475M pipeline placed layers `[0, 17)` on the laptop and `[17, 26)` on the server.
+Both stages reported gradients, AdamW state and nonzero optimizer time, with five completed
+updates. Each pipeline step sent approximately 5.25 MB across the network. The five-step loss
+curves at both 396M and 475M matched their laptop-only counterparts within 3.58e-7 absolute.
+This verifies actual distributed training at these sizes, not merely a proposed partition.
+
+At the same 475M size, the mesh was **5.02x faster in this five-step comparison** (0.615 versus
+0.122 steps/s). This is under the user's current driver configuration: Sysmem Fallback was
+left unchanged, without verifying the driver profile. The laptop's 9.10 GiB allocation peak
+exceeds its 8 GiB physical capacity. Both the laptop and mesh completed 475M, so capacity gain
+for the tested sizes is **1.00x**, with no demonstrated dedicated-VRAM-only capacity gain.
+The 396M laptop rate was slower than its 475M rate, illustrating the variability of these
+short runs with memory pressure; these are not general performance or convergence results.
+
+The server's largest successful tested model was 153.3M; 178.5M failed with CUDA OOM.
+The 553.7M two-GPU candidate was rejected by the planner, not tested to hardware OOM.
+The largest successful tested sizes are not exact capacity limits.
+
+Initial setup attempts suffered missed laptop heartbeats, blocked sandboxed outbound LAN
+traffic, or an assignment racing the previous worker's pending command poll during restart.
+Those attempts are excluded from successful comparisons. Final mesh runs used LAN access,
+a 120-second connection window and a 120-second coordinator heartbeat timeout; the final
+restart also allowed the old command poll to expire. No fresh compute/network benchmark
+was run after coordinator restart, so these rates describe the selected plans rather than
+an optimized placement sweep.
+
+The consolidated local evidence is in `runs/capacity-validation-20261006/report.md` and
+`comparison.json`. Source manifests preserve failed and rejected attempts as well as the
+successful jobs, their plans, loss curves and per-stage memory/timing metrics.
 
 ## Milestone 8 — tiny Transformer benchmark
 

@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MeshTrain · Training dashboard</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101316; --panel:#171c20; --line:#2c343b; --text:#edf2f4; --muted:#9daab5; --accent:#83ddb7; --mono:Consolas,'Cascadia Mono',monospace; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 'Segoe UI',system-ui,sans-serif; }
+    button,select { font:inherit; color:inherit; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 12px; cursor:pointer; }
+    button:hover,select:hover { border-color:var(--accent); }
+    button:disabled { opacity:.45; cursor:default; }
+    :focus-visible { outline:2px solid var(--accent); outline-offset:4px; }
+    a { color:var(--accent); text-decoration:none; }
+    code,.number { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+    .muted { color:var(--muted); }
+    .shell { max-width:1440px; margin:auto; padding:0 36px 48px; }
+    header { height:80px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); gap:20px; }
+    .brand { display:flex; align-items:center; gap:12px; font-size:18px; font-weight:650; letter-spacing:-.4px; }
+    .mark { display:grid; place-items:center; width:32px; height:32px; border:1px solid var(--accent); border-radius:6px; color:var(--accent); font:600 18px var(--mono); }
+    .header-note { font-size:12px; color:var(--muted); border-left:1px solid var(--line); padding-left:18px; margin-left:8px; font-weight:400; letter-spacing:0; }
+    .connection { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+    .dot { width:7px; height:7px; background:var(--muted); border-radius:50%; }
+    .connection.live .dot { background:var(--accent); }
+    .connection.live { color:var(--accent); }
+    nav { display:flex; gap:26px; height:50px; border-bottom:1px solid var(--line); }
+    nav a { display:flex; align-items:center; color:var(--muted); font-size:13px; }
+    nav a:first-child { color:var(--text); border-bottom:2px solid var(--accent); }
+    .page-heading { display:flex; justify-content:space-between; align-items:center; gap:24px; padding:30px 0 24px; }
+    h1 { margin:0 0 5px; font-size:28px; line-height:1.2; font-weight:600; letter-spacing:-.8px; }
+    h2 { margin:0; font-size:15px; font-weight:600; }
+    p { margin:0; }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; }
+    .overview { display:grid; grid-template-columns:repeat(3,1fr) 2fr; padding:17px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); margin-bottom:28px; gap:20px; }
+    .label { font-size:11px; color:var(--muted); letter-spacing:.9px; text-transform:uppercase; }
+    .overview strong { display:block; margin-top:3px; font:500 19px var(--mono); }
+    .overview .address { font-size:14px; padding-top:4px; word-break:break-all; }
+    .workspace { display:grid; grid-template-columns:248px minmax(0,1fr); gap:24px; align-items:start; }
+    .panel { border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
+    .panel-heading { padding:18px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .panel-heading .muted { font-size:12px; }
+    #jobs { max-height:575px; overflow:auto; padding:8px; }
+    .job { display:block; text-align:left; width:100%; background:transparent; padding:13px 12px; margin:2px 0; border-color:transparent; }
+    .job[aria-pressed="true"] { background:#23332d; border-color:#456455; }
+    .job-name { display:block; font-weight:600; overflow-wrap:anywhere; margin-bottom:7px; }
+    .job-detail { display:flex; justify-content:space-between; align-items:center; font-size:11px; gap:8px; }
+    .job-id { display:block; font:10px var(--mono); color:var(--muted); overflow-wrap:anywhere; margin-top:6px; }
+    .badge { display:inline-block; border:1px solid var(--line); border-radius:4px; padding:2px 6px; color:var(--muted); font-size:10px; letter-spacing:.4px; }
+    .badge.running,.badge.online,.badge.busy,.badge.completed { color:var(--accent); border-color:#456455; }
+    .badge.failed { color:#ffb4ab; border-color:#6b4444; }
+    .empty-sidebar { padding:28px 14px; color:var(--muted); font-size:13px; }
+    .run-heading { display:flex; justify-content:space-between; align-items:center; gap:14px; margin-bottom:18px; }
+    .run-heading h2 { font-size:20px; letter-spacing:-.3px; overflow-wrap:anywhere; }
+    .run-heading p { font-size:12px; color:var(--muted); margin-top:4px; overflow-wrap:anywhere; }
+    .metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border-bottom:1px solid var(--line); margin-bottom:22px; padding:0 0 20px; gap:16px; }
+    .metric-value { font:500 27px var(--mono); display:block; margin:8px 0 4px; letter-spacing:-1px; }
+    .metric-note { font-size:11px; color:var(--muted); }
+    .chart-controls { display:flex; gap:8px; }
+    .chart-controls select { font-size:12px; padding:5px 8px; }
+    figure { margin:0; position:relative; }
+    #chart { display:block; width:100%; height:310px; touch-action:pan-y; }
+    #chart text { font:11px var(--mono); fill:var(--muted); }
+    .chart-empty { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; gap:9px; padding:28px; pointer-events:none; }
+    .chart-empty strong { font-size:16px; font-weight:500; }
+    .chart-empty p { color:var(--muted); font-size:12px; max-width:390px; }
+    figcaption { border-top:1px solid var(--line); padding:11px 20px; font:11px var(--mono); color:var(--muted); min-height:40px; }
+    .stage-panel { margin-top:20px; }
+    .table-scroll { overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; font-size:12px; white-space:nowrap; }
+    th { font-weight:400; color:var(--muted); text-align:left; font-size:10px; text-transform:uppercase; letter-spacing:.6px; padding:12px 16px; border-bottom:1px solid var(--line); }
+    td { padding:14px 16px; border-bottom:1px solid var(--line); }
+    tbody tr:last-child td { border-bottom:0; }
+    .worker-name { font-weight:600; }
+    .subtext { display:block; color:var(--muted); font-size:11px; margin-top:3px; }
+    .table-empty { text-align:center; color:var(--muted); padding:26px; }
+    #workers-panel { margin-top:30px; scroll-margin-top:24px; }
+    .alert { margin:0 0 20px; padding:12px 16px; border:1px solid #6b4444; border-radius:6px; background:#2e2021; color:#ffb4ab; font-size:13px; overflow-wrap:anywhere; }
+    [hidden] { display:none !important; }
+    footer { margin-top:22px; display:flex; justify-content:space-between; gap:14px; color:var(--muted); font-size:11px; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; }
+    @media(max-width:1000px) { .shell { padding:0 24px 32px; } .workspace { grid-template-columns:210px minmax(0,1fr); gap:18px; } .metrics { grid-template-columns:repeat(2,1fr); } .overview { grid-template-columns:repeat(3,1fr); } .overview>div:last-child { grid-column:1/-1; } }
+    @media(max-width:700px) { .shell { padding:0 16px 24px; } .header-note { display:none; } .page-heading { align-items:flex-start; flex-direction:column; padding:24px 0 20px; } .workspace { grid-template-columns:1fr; } #jobs { max-height:210px; } .run-heading { align-items:flex-start; } .panel-heading { flex-wrap:wrap; padding:14px 16px; } .overview { gap:12px; } .overview strong { font-size:17px; } #chart { height:260px; } footer { flex-direction:column; } }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div class="brand"><span class="mark" aria-hidden="true">M</span>MeshTrain<span class="header-note">Distributed training</span></div>
+    <div class="connection" id="connection" role="status"><span class="dot"></span><span id="connection-text">Connecting…</span></div>
+  </header>
+  <nav aria-label="Dashboard navigation"><a href="#training">Training</a><a href="#workers-panel">Workers</a></nav>
+  <main id="training">
+    <div class="page-heading">
+      <div><h1>Training overview</h1><p class="muted">A live view of your cluster, from first step to final loss.</p></div>
+      <div class="controls"><button id="pause" aria-pressed="false">Pause live</button><button id="refresh">Refresh</button></div>
+    </div>
+    <div id="error" class="alert" role="alert" hidden></div>
+    <section class="overview" aria-label="Cluster overview">
+      <div><span class="label">Workers online</span><strong id="online">—</strong></div>
+      <div><span class="label">Active runs</span><strong id="active">—</strong></div>
+      <div><span class="label">Completed runs</span><strong id="completed">—</strong></div>
+      <div><span class="label">Coordinator</span><strong class="address" id="coordinator">Connecting…</strong></div>
+    </section>
+    <div class="workspace">
+      <aside class="panel" aria-label="Training runs">
+        <div class="panel-heading"><h2>Runs</h2><span class="muted" id="run-count">—</span></div>
+        <div id="jobs"><p class="empty-sidebar">Loading training runs…</p></div>
+      </aside>
+      <section aria-label="Selected training run">
+        <div class="run-heading"><div><h2 id="run-name">Waiting for training</h2><p id="run-detail">Select a run to inspect its metrics.</p></div><button id="export" disabled>Export JSON</button></div>
+        <div id="run-error" class="alert" hidden></div>
+        <div class="metrics">
+          <div><span class="label">Latest loss</span><strong class="metric-value" id="loss">—</strong><span class="metric-note" id="loss-note">No samples yet</span></div>
+          <div><span class="label">Steps recorded</span><strong class="metric-value" id="steps">—</strong><span class="metric-note">Unique measured steps</span></div>
+          <div><span class="label">Step time</span><strong class="metric-value" id="step-time">—</strong><span class="metric-note" id="time-note">Latest first-stage timing</span></div>
+          <div><span class="label">Data sent / step</span><strong class="metric-value" id="sent">—</strong><span class="metric-note">Sum of latest stage measurements</span></div>
+        </div>
+        <section class="panel" aria-label="Training loss">
+          <div class="panel-heading"><div><h2>Loss curve</h2><span class="muted">Measured loss by training step</span></div><div class="chart-controls">
+            <select id="range" aria-label="Loss chart range"><option value="all">All steps</option><option value="50">Last 50 steps</option></select>
+            <select id="scale" aria-label="Loss chart scale"><option value="linear">Linear scale</option><option value="log">Log scale</option></select>
+          </div></div>
+          <figure>
+            <svg id="chart" viewBox="0 0 1000 310" role="img" tabindex="0" aria-label="Training loss chart. Use left and right arrow keys to inspect steps."></svg>
+            <div id="chart-empty" class="chart-empty"><strong>No training metrics yet</strong><p>Start a cluster run with <code>meshtrain train CONFIG.yaml</code> in your terminal. Its metrics will appear here automatically.</p></div>
+            <figcaption><output id="chart-detail">Move over the chart or use ← → to inspect a step.</output></figcaption>
+          </figure>
+        </section>
+        <section class="panel stage-panel" aria-label="Pipeline stage metrics">
+          <div class="panel-heading"><h2>Pipeline stages</h2><span class="muted">Latest measurement per stage</span></div>
+          <div class="table-scroll"><table><caption class="sr-only">Latest pipeline stage timings and memory usage</caption>
+            <thead><tr><th>Stage / worker</th><th>Step</th><th>Forward</th><th>Backward</th><th>Comm.</th><th>Idle</th><th>Utilization</th><th>Parameters / activations peak</th></tr></thead>
+            <tbody id="stages"><tr><td colspan="8" class="table-empty">Stage metrics will appear when training begins.</td></tr></tbody>
+          </table></div>
+        </section>
+      </section>
+    </div>
+    <section class="panel" id="workers-panel" aria-label="Cluster workers">
+      <div class="panel-heading"><div><h2>Cluster workers</h2><span class="muted">Hardware, heartbeat, and current workload</span></div><span class="muted" id="worker-count">—</span></div>
+      <div class="table-scroll"><table><caption class="sr-only">Workers and their live resource usage</caption>
+        <thead><tr><th>Worker / address</th><th>Device</th><th>Status</th><th>Allocated / device memory</th><th>System RAM</th><th>Compute score</th><th>Heartbeat</th></tr></thead>
+        <tbody id="workers"><tr><td colspan="7" class="table-empty">Loading workers…</td></tr></tbody>
+      </table></div>
+    </section>
+  </main>
+  <footer><span>Metrics from the connected coordinator · refreshes every 2 seconds</span><span id="updated">Waiting for first update</span></footer>
+</div>
+<script>
+  const $ = id => document.getElementById(id);
+  const number = value => typeof value === 'number' && Number.isFinite(value);
+  const format = (value, digits=2) => number(value) ? value.toLocaleString(undefined, {maximumFractionDigits:digits}) : '—';
+  const ms = value => number(value) ? `${format(value * 1000, 1)} ms` : '—';
+  function bytes(value) {
+    if (!number(value)) return '—';
+    const units = ['B','KiB','MiB','GiB']; let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+    return `${format(value, unit ? 1 : 0)} ${units[unit]}`;
+  }
+  function node(tag, text, className) { const result = document.createElement(tag); if (text !== undefined) result.textContent = text; if (className) result.className = className; return result; }
+  function badge(status) { return node('span', status || 'UNKNOWN', `badge ${(status || '').toLowerCase()}`); }
+  function cell(row, text, className='number') { const result = node('td', text, className); row.append(result); return result; }
+  function emptyTable(id, count, message) { const row = node('tr'); const c = cell(row, message, 'table-empty'); c.colSpan = count; $(id).replaceChildren(row); }
+  let data = {jobs:[], workers:[]}, selected = null, paused = false, busy = false, timer, chartPoints = [], hoverStep = null;
+  const current = () => data.jobs.find(job => job.job_id === selected);
+  function losses(job) { return [...new Map((job?.losses || []).filter(([step, loss]) => number(step) && number(loss)).map(pair => [pair[0], pair])).values()].sort((a,b) => a[0]-b[0]); }
+  function render() {
+    const jobs = [...data.jobs].sort((a,b) => b.created_at-a.created_at);
+    if (!jobs.some(job => job.job_id === selected)) selected = (jobs.find(job => job.status === 'RUNNING') || jobs[0])?.job_id || null;
+    $('coordinator').textContent = data.coordinator || '—';
+    $('online').textContent = data.workers.filter(worker => ['ONLINE','BUSY'].includes(worker.status)).length;
+    $('active').textContent = jobs.filter(job => job.status === 'RUNNING').length;
+    $('completed').textContent = jobs.filter(job => job.status === 'COMPLETED').length;
+    $('run-count').textContent = jobs.length;
+    const focused = document.activeElement?.dataset?.jobId;
+    $('jobs').replaceChildren();
+    for (const job of jobs) {
+      const button = node('button', undefined, 'job'); button.dataset.jobId = job.job_id; button.setAttribute('aria-pressed', String(job.job_id === selected));
+      button.append(node('span', job.name || job.job_id, 'job-name'));
+      const detail = node('span', undefined, 'job-detail'); detail.append(badge(job.status), node('span', `${losses(job).length} steps`, 'muted'));
+      button.append(detail, node('span', job.job_id, 'job-id'));
+      button.addEventListener('click', () => { selected = job.job_id; hoverStep = null; render(); });
+      $('jobs').append(button);
+      if (focused === job.job_id) button.focus({preventScroll:true});
+    }
+    if (!jobs.length) $('jobs').append(node('p', 'No runs yet. New cluster runs will appear automatically.', 'empty-sidebar'));
+    renderRun(current()); renderWorkers();
+  }
+  function renderRun(job) {
+    const points = losses(job), latest = points.at(-1), records = Object.entries(job?.last_metrics || {}).sort((a,b) => Number(a[0])-Number(b[0]));
+    const first = records[0]?.[1];
+    $('run-name').textContent = job ? (job.name || job.job_id) : 'Waiting for training';
+    $('run-detail').textContent = job ? `${job.status} · Started ${new Date(job.created_at * 1000).toLocaleString()} · ${job.job_id}` : 'Start a run from your MeshTrain terminal.';
+    $('export').disabled = !job;
+    $('run-error').hidden = !job?.error; $('run-error').textContent = job?.error || '';
+    $('loss').textContent = latest ? format(latest[1], 5) : '—';
+    $('loss-note').textContent = latest ? `Step ${latest[0]} · initial ${format(points[0][1], 5)}` : 'No samples yet';
+    $('steps').textContent = job ? format(points.length || job.summary?.steps || 0, 0) : '—';
+    $('step-time').textContent = ms(first?.step_s ?? job?.summary?.mean_step_s);
+    $('time-note').textContent = first ? `Stage ${records[0][0]} · step ${first.step}` : 'Mean measured step time';
+    const sent = records.filter(([,rec]) => number(rec.bytes_sent));
+    $('sent').textContent = sent.length ? bytes(sent.reduce((sum,[,rec]) => sum+rec.bytes_sent,0)) : bytes(job?.summary?.bytes_per_step);
+    $('stages').replaceChildren();
+    for (const [stage, rec] of records) {
+      const row = node('tr'); const title = cell(row, `Stage ${stage}`, 'worker-name'); title.append(node('span', `${rec.worker || job.stage_workers?.[Number(stage)] || '—'} · ${(rec.backend || '').toUpperCase()}`, 'subtext'));
+      cell(row, format(rec.step,0)); cell(row, ms(rec.forward_s)); cell(row, ms(rec.backward_s)); cell(row, ms(rec.comm_s)); cell(row, ms(rec.idle_s));
+      cell(row, number(rec.utilization) ? `${format(rec.utilization*100,1)}%` : '—');
+      cell(row, `${bytes(rec.memory?.parameters)} / ${bytes(rec.memory?.saved_activations_peak)}`);
+      $('stages').append(row);
+    }
+    if (!records.length) emptyTable('stages',8,'Stage metrics will appear when training begins.');
+    renderChart(points);
+  }
+  function renderWorkers() {
+    $('workers').replaceChildren(); $('worker-count').textContent = `${data.workers.length} registered`;
+    for (const worker of data.workers) {
+      const row = node('tr'); const name = cell(row, worker.name || worker.worker_id, 'worker-name'); name.append(node('span', worker.data_address, 'subtext'));
+      const device = cell(row, worker.device?.name || '—', ''); device.append(node('span',(worker.backend || '').toUpperCase(),'subtext'));
+      if (worker.current_job) device.append(node('span',worker.current_job,'subtext'));
+      cell(row, undefined, '').append(badge(worker.status));
+      cell(row, `${bytes(worker.memory?.allocated)} / ${bytes(worker.device?.memory_total)}`);
+      cell(row, bytes(worker.ram_total)); cell(row,format(worker.benchmark?.compute_score));
+      cell(row,number(worker.last_heartbeat_age_s) ? `${format(worker.last_heartbeat_age_s,1)} s ago` : '—');
+      $('workers').append(row);
+    }
+    if (!data.workers.length) emptyTable('workers',7,'No workers registered. Start or join a MeshTrain cluster.');
+  }
+  function svg(tag, attrs, text) { const result = document.createElementNS('http://www.w3.org/2000/svg',tag); for (const [key,value] of Object.entries(attrs)) result.setAttribute(key,value); if (text !== undefined) result.textContent = text; return result; }
+  function renderChart(points) {
+    const log = $('scale').value === 'log';
+    points = points.filter(([,loss]) => !log || loss > 0);
+    if ($('range').value !== 'all') points = points.slice(-Number($('range').value));
+    $('chart').replaceChildren(); chartPoints = []; $('chart-empty').hidden = Boolean(points.length);
+    $('chart-detail').textContent = log ? 'Log scale · positive losses only. Use ← → or move over the curve.' : 'Move over the chart or use ← → to inspect a step.';
+    if (!points.length) return;
+    const values = points.map(([,loss]) => log ? Math.log10(loss) : loss), low = Math.min(...values), high = Math.max(...values), spread = (high-low) || Math.max(Math.abs(low)*.15,.01);
+    const ymin = low-spread*.1, ymax = high+spread*.1, xmin = points[0][0], xmax = points.at(-1)[0];
+    const x = step => 68+(step-xmin)/((xmax-xmin)||1)*906, y = value => 24+(ymax-value)/(ymax-ymin)*246;
+    for (let i=0;i<5;i++) {
+      const value = ymin+(ymax-ymin)*i/4, position = y(value);
+      $('chart').append(svg('line',{x1:68,y1:position,x2:974,y2:position,stroke:'#2c343b','stroke-dasharray':'3 5'}),svg('text',{x:56,y:position+4,'text-anchor':'end'},Number(log ? 10**value : value).toPrecision(3)));
+    }
+    for (let i=0;i<5;i++) {
+      const step = xmin+(xmax-xmin)*i/4;
+      if (xmax === xmin && i > 0) break;
+      $('chart').append(svg('text',{x:x(step),y:294,'text-anchor':'middle'},format(step,0)));
+    }
+    chartPoints = points.map(([step,loss],i) => ({step,loss,x:x(step),y:y(values[i])}));
+    const coordinates = chartPoints.map(point => `${point.x},${point.y}`).join(' ');
+    $('chart').append(svg('polygon',{points:`${chartPoints[0].x},270 ${coordinates} ${chartPoints.at(-1).x},270`,fill:'#83ddb7','fill-opacity':'.06'}),svg('polyline',{points:coordinates,fill:'none',stroke:'#83ddb7','stroke-width':2.5,'stroke-linejoin':'round','vector-effect':'non-scaling-stroke'}));
+    if (chartPoints.length === 1) $('chart').append(svg('circle',{cx:chartPoints[0].x,cy:chartPoints[0].y,r:4,fill:'#83ddb7'}));
+    $('chart').append(svg('line',{id:'crosshair',x1:0,x2:0,y1:24,y2:270,stroke:'#9daab5','stroke-dasharray':'4 4',visibility:'hidden'}),svg('circle',{id:'chart-point',cx:0,cy:0,r:4,fill:'#83ddb7',stroke:'#171c20','stroke-width':2,visibility:'hidden'}));
+    if (hoverStep !== null) inspect(chartPoints.findIndex(point => point.step === hoverStep));
+  }
+  function inspect(index) {
+    const point = chartPoints[index]; if (!point) return;
+    hoverStep = point.step;
+    $('crosshair').setAttribute('x1',point.x); $('crosshair').setAttribute('x2',point.x); $('crosshair').setAttribute('visibility','visible');
+    $('chart-point').setAttribute('cx',point.x); $('chart-point').setAttribute('cy',point.y); $('chart-point').setAttribute('visibility','visible');
+    $('chart-detail').textContent = `Step ${point.step} · loss ${point.loss.toPrecision(7)}`;
+  }
+  $('chart').addEventListener('pointermove', event => {
+    if (!chartPoints.length) return;
+    const rect = $('chart').getBoundingClientRect();
+    // The SVG preserves its aspect ratio; account for letterboxing on narrow screens.
+    const scale = Math.min(rect.width/1000,rect.height/310), left = (rect.width-1000*scale)/2;
+    const x = (event.clientX-rect.left-left)/scale;
+    let nearest = 0; chartPoints.forEach((point,i) => { if (Math.abs(point.x-x)<Math.abs(chartPoints[nearest].x-x)) nearest=i; }); inspect(nearest);
+  });
+  $('chart').addEventListener('keydown', event => {
+    if (!chartPoints.length || !['ArrowLeft','ArrowRight'].includes(event.key)) return;
+    event.preventDefault(); let index = chartPoints.findIndex(point => point.step === hoverStep);
+    if (index < 0) index = event.key === 'ArrowRight' ? -1 : chartPoints.length;
+    inspect(Math.max(0,Math.min(chartPoints.length-1,index+(event.key==='ArrowRight'?1:-1))));
+  });
+  for (const id of ['range','scale']) $(id).addEventListener('change',() => { hoverStep=null; renderChart(losses(current())); });
+  function connection(text, live=false) { $('connection-text').textContent=text; $('connection').classList.toggle('live',live); }
+  async function refresh() {
+    if (busy) return;
+    busy=true; clearTimeout(timer); $('refresh').disabled=true;
+    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(),12000);
+    try {
+      const response = await fetch('/api/snapshot',{signal:controller.signal,cache:'no-store'});
+      const snapshot = await response.json();
+      if (!response.ok) throw new Error(snapshot.detail || 'Unable to read the coordinator.');
+      data=snapshot; render(); $('error').hidden=true;
+      connection(paused?'Paused':'Live · every 2 s',!paused);
+      $('updated').textContent=`Updated ${new Date().toLocaleTimeString()}`;
+    } catch (error) {
+      $('error').hidden=false; $('error').textContent=`Connection interrupted. ${error.name==='AbortError'?'Coordinator request timed out.':error.message} Previous measurements remain visible.`;
+      connection('Disconnected');
+    } finally {
+      clearTimeout(timeout); busy=false; $('refresh').disabled=false;
+      if (!paused) timer=setTimeout(refresh,2000);
+    }
+  }
+  $('refresh').addEventListener('click',refresh);
+  $('pause').addEventListener('click',() => { paused=!paused; $('pause').textContent=paused?'Resume live':'Pause live'; $('pause').setAttribute('aria-pressed',String(paused)); clearTimeout(timer); if (paused) connection('Paused'); else refresh(); });
+  $('export').addEventListener('click',() => {
+    const job=current(); if (!job) return;
+    const url=URL.createObjectURL(new Blob([JSON.stringify(job,null,2)],{type:'application/json'}));
+    const link=node('a'); link.href=url; link.download=`${job.job_id.replace(/[^a-zA-Z0-9._-]/g,'_')}.json`; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+  });
+  refresh();
+</script>
+</body>
+</html>

@@ -31,6 +31,8 @@ For a stage with layers L, P = parameter bytes, on a device with T bytes:
                                 (one layer's backward re-materialises gradients of what it saved)
 
     fits  <=>  Σ components <= usable
+               usable is further capped at the live ``available`` memory
+               (free + reclaimable allocator cache) when a worker reports it
 
 Defaults (all configurable, see config ``memory:``): safety_factor cuda 0.85,
 mps 0.80, cpu 0.85; framework_reserve cuda 0.4 GB (CUDA context, cuBLAS/cuDNN
@@ -68,6 +70,7 @@ class MemoryEstimate:
     framework_reserve: int = 0
     host_staging: int = 0
     in_flight: int = 1
+    available: int | None = None   # live free + reclaimable cache from a heartbeat (None = unknown)
 
     COMPONENTS = ("parameters", "gradients", "optimizer_state", "optimizer_step_temporary", "master_weights",
                   "saved_activations", "input_buffers", "output_buffers", "transport_buffers",
@@ -101,7 +104,10 @@ class MemoryEstimate:
     def format(self, worker: str, unified: bool = False) -> str:
         gb = lambda n: f"{n / GB:8.2f} GB"  # noqa: E731
         star = "*" if unified else ""
-        rows = [(f"total accelerator memory{star}", self.total), ("usable (after safety/framework)", self.usable)]
+        rows = [(f"total accelerator memory{star}", self.total)]
+        if self.available is not None:
+            rows.append(("available (live, incl. cache)", self.available))
+        rows.append(("usable (after safety/framework)", self.usable))
         rows += [(k.replace("_", " "), getattr(self, k)) for k in self.COMPONENTS if getattr(self, k)]
         rows += [("required", self.required), ("free after plan", self.usable - self.required)]
         out = [f"Worker: {worker}"] + [f"    {k:<34}{gb(v)}" for k, v in rows]
@@ -131,12 +137,13 @@ def estimate_stage_memory(layers, *, total: int, optimizer: str, num_microbatche
                           schedule: str = "gpipe", max_inflight: int | None = None, backend: str = "cuda",
                           safety_factor: float | None = None, framework_reserve: int | None = None,
                           headroom_fraction: float | None = None, headroom_min_bytes: int | None = None,
-                          activation_safety: float = 1.25) -> MemoryEstimate:
+                          activation_safety: float = 1.25, available: int | None = None) -> MemoryEstimate:
     """Estimate one stage's device memory (see module docstring).
 
     ``headroom_fraction``/``headroom_min_bytes`` reproduce V1's margin
     (``reserved = max(fraction*T, min)``) when given; otherwise the per-backend
-    ``safety_factor``/``framework_reserve`` apply.
+    ``safety_factor``/``framework_reserve`` apply. ``available`` (live free
+    memory) caps the usable budget when known.
     """
     if num_stages is None:  # V1 call style: only "is_last" known
         num_stages, stage_index = (1, 0) if is_last else (2, 0)
@@ -156,6 +163,8 @@ def estimate_stage_memory(layers, *, total: int, optimizer: str, num_microbatche
         sf = DEFAULT_SAFETY_FACTOR.get(backend, 0.85) if safety_factor is None else safety_factor
         fw = DEFAULT_FRAMEWORK_RESERVE.get(backend, 0) if framework_reserve is None else framework_reserve
         usable = int(total * sf) - fw
+    if available is not None:
+        usable = max(0, min(usable, int(available)))
     return MemoryEstimate(
         total=int(total),
         usable=usable,
@@ -172,4 +181,5 @@ def estimate_stage_memory(layers, *, total: int, optimizer: str, num_microbatche
         framework_reserve=fw,
         host_staging=0 if backend == "cpu" else (in_flight + 2) * boundary,
         in_flight=in_flight,
+        available=available,
     )

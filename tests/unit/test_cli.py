@@ -59,6 +59,9 @@ def test_short_commands_parse():
     assert bp.what == "pipeline" and bp.bandwidth_mbps == 50 and bp.devices == "cuda,cuda"
     assert p.parse_args(["cluster", "benchmark"]).func.__name__ == "cmd_cluster_benchmark"
     assert p.parse_args(["inspect", "placement", "c.yaml"]).config == "c.yaml"
+    assert p.parse_args(["dashboard"]).port == 8081
+    dashboard = p.parse_args(["dashboard", "--port", "8091", "--coordinator", "host:8080", "--token", "tok"])
+    assert (dashboard.port, dashboard.coordinator, dashboard.token) == (8091, "host:8080", "tok")
 
 
 def test_capacity_hardware_uses_remembered_cluster(tmp_path, monkeypatch):

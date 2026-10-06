@@ -72,6 +72,9 @@ class ControlClient:
     def job(self, job_id: str) -> dict:
         return self._call("GET", f"/jobs/{job_id}")
 
+    def jobs(self) -> dict:
+        return self._call("GET", "/jobs")
+
     def stop_job(self, job_id: str) -> dict:
         return self._call("POST", f"/jobs/{job_id}/stop")
 

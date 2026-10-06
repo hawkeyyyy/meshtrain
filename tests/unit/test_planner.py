@@ -1,6 +1,8 @@
 import pytest
 
 from meshtrain.models import MLPSpec, TinyTransformerSpec
+from meshtrain.coordinator.scheduler import worker_profile
+from meshtrain.coordinator.state import WorkerRecord
 from meshtrain.planner.cost import NetworkModel, pipeline_step_time
 from meshtrain.planner.graph import profile_model
 from meshtrain.planner.memory import estimate_stage_memory
@@ -131,3 +133,29 @@ def test_memory_estimate_components():
     mps = estimate_stage_memory(layers, total=8 * GB, optimizer="adamw", num_microbatches=8, is_last=True,
                                 backend="mps")
     assert mps.usable == int(8 * GB * 0.80) and mps.in_flight == 1
+
+
+@pytest.mark.parametrize("memory,available", [
+    ({}, None),
+    ({"free": 0}, 0),
+    ({"free": GB, "reserved": 2 * GB, "allocated": GB}, 2 * GB),
+    ({"free": GB, "reserved": 0, "allocated": GB}, GB),
+    ({"free": 10 * GB}, 4 * GB),
+    ({"free": 0, "reserved": 6 * GB, "allocated": 2 * GB}, 0),
+])
+def test_live_cuda_memory_caps_budget_without_counting_live_allocations_as_cache(memory, available):
+    w = WorkerRecord("w", "w", {}, "cuda", {"memory_total": 4 * GB}, "localhost", 29500,
+                     memory=memory)
+    p = worker_profile(w)
+    assert p.memory_total == 4 * GB and p.memory_available == available
+    layers = profile_model(MLPSpec(), 2)
+    plan = make_plan("equal", layers, [p], opts=PlannerOptions(optimizer="adamw"))
+    if available == 0:  # V1.5 excludes a worker with no usable memory before partitioning
+        assert not plan.feasible and not plan.stages
+        return
+    m = plan.stages[0].memory
+    base = int(4 * GB * 0.85) - int(0.4 * GB)   # V1.5 CUDA safety factor and framework reserve
+    assert m.available == available
+    assert m.budget == (base if available is None else min(base, available))
+    assert plan.feasible == (available != 0)
+

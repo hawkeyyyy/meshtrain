@@ -46,6 +46,7 @@ class WorkerProfile:
     supported_ops: dict | None = None   # dtype -> ops the worker's probes ran (None = unknown)
     d2h_Bps: float = 0.0                # measured device->host copy rate (0 = no copy, CPU)
     h2d_Bps: float = 0.0
+    memory_available: int | None = None  # free + reclaimable allocator cache, from a heartbeat
 
 
 @dataclass
@@ -208,7 +209,7 @@ class _Evaluator:
                                     num_microbatches=self.opts.num_microbatches, is_last=last,
                                     stage_index=idx, num_stages=len(workers), schedule=self.opts.schedule,
                                     max_inflight=self.opts.max_inflight, backend=w.backend,
-                                    activation_safety=self.opts.activation_safety,
+                                    activation_safety=self.opts.activation_safety, available=w.memory_available,
                                     **self.opts.memory_kwargs(w.backend))
         return StagePlan(idx, w.worker_id, w.name, w.backend, start, end, mem, comp, comm, out_bytes,
                          overlap=self.opts.async_transport, comm_detail=detail)
@@ -218,8 +219,10 @@ def _usable(w: WorkerProfile, opts: PlannerOptions) -> int:
     total = opts.budget_overrides.get(w.worker_id, w.memory_total)
     kw = opts.memory_kwargs(w.backend)
     if "headroom_fraction" in kw:
-        return total - reserved_bytes(total, kw["headroom_fraction"] or 0.0, kw["headroom_min_bytes"] or 0)
-    return int(total * kw["safety_factor"]) - kw["framework_reserve"]
+        usable = total - reserved_bytes(total, kw["headroom_fraction"] or 0.0, kw["headroom_min_bytes"] or 0)
+    else:
+        usable = int(total * kw["safety_factor"]) - kw["framework_reserve"]
+    return usable if w.memory_available is None else min(usable, w.memory_available)
 
 
 def eligible_workers(workers: list[WorkerProfile], opts: PlannerOptions) -> tuple[list[WorkerProfile], dict[str, str]]:

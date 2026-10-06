@@ -17,14 +17,14 @@ execution across consumer accelerators.* V1 is the minimal, correct foundation; 
 | Milestone | Status |
 |---|---|
 | 1. Local CPU prototype: stages in separate processes, gradient equivalence | **Verified on CPU.** Gradients match single-process PyTorch: MLP error 0, Transformer ≤ 3e-7 relative |
-| 2. TCP transport | **Verified over loopback TCP on one host.** Not yet run across two physical machines |
-| 3. CUDA → CUDA | Implemented (`CUDADeviceAdapter`, CUDA-marked tests). **Not run: no CUDA hardware was available** |
+| 2. TCP transport | **Verified over loopback and a physical LAN**: activations and gradients transmitted between two GPU machines |
+| 3. CUDA → CUDA | **Measured on RTX 4070 Laptop → GTX 1050 Ti**: 396M and 475M models completed five steps across both GPUs; five-step loss curves match laptop-only runs within 3.6e-7 absolute |
 | 4. CUDA → CUDA → MPS | Implemented (`MPSDeviceAdapter`, MPS-marked tests). **Not run: no CUDA/MPS hardware was available** |
 | 5. Microbatch (GPipe) pipeline | **Verified on CPU.** Microbatch routing and accumulation equal full-batch gradients |
 | 6. Hardware / network profiler | **Verified on CPU workers**: compute benchmark, directional latency/bandwidth matrix |
 | 7. Static partition planner | **Verified** (unit tests + emulated experiment): equal / compute / auto (memory + compute + network) |
 | 8. Tiny Transformer benchmark | **Verified on CPU**: 3 stages over TCP, loss curve matches single-process to 2e-7 |
-| 9. Capacity experiment | **Emulated on CPU only** (scaled-down budgets): capacity gain 2.59x. The hardware mode exists but has **not** been run on physical GPUs |
+| 9. Capacity experiment | **Emulated gain 2.59x; physical mesh trained 475M.** The laptop also trained 475M with a 9.10 GiB allocation peak; a dedicated-VRAM-only capacity gain remains unproven. See the hardware comparison in the results document |
 
 All numbers and their environments are in [docs/v1-results.md](docs/v1-results.md).
 
@@ -42,7 +42,7 @@ Placement is still static: each stage stays on one worker for the whole job. See
 | 5. 1F1B on CPU | **Verified**: gradients equal GPipe and single-process; stage-0 activations 37.9 → 14.2 MB |
 | 6. 1F1B on CUDA | Implemented; CUDA-marked tests **not run (no GPU)** |
 | 7. Compute/communication overlap | **Measured on CPU** with an emulated 100 Mbit/s link: 864 → 501 ms/step |
-| 8. Memory estimation + startup OOM replanning | **Verified on CPU** with emulated device memory; estimator matches the real RTX 4070 + 1050 Ti outcomes (396M fits, 475M rejected) |
+| 8. Memory estimation + startup OOM replanning | **Verified on CPU** with emulated device memory; estimator matches the earlier RTX 4070 + 1050 Ti outcomes (396M fits, 475M rejected). It is conservative: a later run trained 475M across both GPUs, a split this estimator still rejects |
 | 9. MPS adapter, CUDA→CUDA→MPS | Implemented with capability probes; MPS tests **not run (no Mac)** |
 | 10. Topology-aware planner | **Verified** (unit tests) |
 | 11. Timeline tracing, benchmark reports | **Verified on CPU**: Chrome traces, overlap/idle breakdown, prediction accuracy |
@@ -135,6 +135,42 @@ MESHTRAIN_TOKEN=dev uv run meshtrain --coordinator 127.0.0.1:8090 cluster benchm
 MESHTRAIN_TOKEN=dev uv run meshtrain --coordinator 127.0.0.1:8090 train configs/tiny_transformer_cpu.yaml
 ```
 
+## Interactive terminal
+
+```sh
+uv run meshtrain console
+```
+
+The console groups the cluster, training, and monitoring tools. Enter commands directly at the
+`meshtrain >` prompt, for example `status`, `jobs`, `plan configs/local_cpu.yaml`, or
+`train configs/local_cpu.yaml`. Use `help train` for command options, `help` for the tools menu,
+and `exit` to leave. It uses the remembered cluster and accepts `--coordinator` / `--token` overrides.
+Blank input does not repeat a command; help and command errors return to the prompt.
+
+Cluster startup and the console display a colored MESHTRAIN ASCII banner. Status, benchmark, and
+job tables use terminal colors. Redirected output stays plain; set `NO_COLOR`
+to disable colors in a terminal. `meshtrain jobs` shows unique measured steps, latest loss, and
+the latest first-stage step time. Hardware capacity experiments resolve flags, environment variables,
+and the remembered cluster in that order, just like other cluster commands.
+
+## Live training dashboard
+
+With a cluster running, open a second terminal on this machine:
+
+```sh
+uv run meshtrain dashboard
+```
+
+Open **http://127.0.0.1:8081** to see workers, training runs, the live loss curve, and per-stage
+compute, communication, and memory metrics. Select a run, inspect chart points with the mouse or
+arrow keys, choose a linear/log scale, pause updates, or export a run as JSON. Updates arrive every
+two seconds. The dashboard uses the remembered cluster; `--coordinator` and `--token` also work.
+Use `--port 8091` if port 8081 is occupied.
+
+The dashboard binds to this machine's loopback interface and keeps the cluster token on the server.
+It observes jobs launched through the coordinator (`meshtrain train CONFIG`); `--local` runs are not
+included. Run history is available while the coordinator process is running.
+
 ## Experiments
 
 ```sh
@@ -156,6 +192,13 @@ Each cluster run writes `runs/<job>/timeline.json` (open in https://ui.perfetto.
 Experiments 2 and 3 are `meshtrain train configs/two_cuda.yaml` / `configs/cuda_cuda_mps.yaml`
 followed by `meshtrain results record`. Recording replays the first steps on CPU and reports the
 loss-curve deviation as a correctness check.
+
+Hardware capacity comparisons require at least two online workers. Each mesh trial uses one stage
+per worker; the report includes the stage count. CUDA Adam/AdamW plans budget an additional
+parameter set for foreach update workspace and cap usable VRAM using the latest heartbeat's free
+memory plus unused allocator cache. Cached pools larger than physical VRAM are excluded from that
+cap. These are estimates; a dedicated-VRAM-only baseline still requires verifying the GPU driver's
+Sysmem Fallback configuration before testing.
 
 ## Configuration
 

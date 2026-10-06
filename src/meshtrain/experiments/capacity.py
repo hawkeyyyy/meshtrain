@@ -159,8 +159,10 @@ def run_emulated(steps: int = 5, write_doc: bool = True) -> str:
 
 
 def run_hardware(client, sizes=SIZES, steps: int = 5, write_doc: bool = True, poll_s: float = 1.0) -> str:
-    """Real-device capacity search through a running coordinator (not yet run on physical hardware)."""
+    """Real-device capacity search, with the mesh constrained to use every online worker."""
     workers = [w for w in client.status()["workers"] if w["status"] == "ONLINE"]
+    if len(workers) < 2:
+        raise ValueError("hardware capacity comparison requires at least two online workers; check meshtrain status")
 
     def submit(cfg_model, *, require=None, num_stages=None, strategy="auto", enforce=False):
         cfg = {"job": {"name": "capacity"}, "model": cfg_model,
@@ -200,7 +202,7 @@ def run_hardware(client, sizes=SIZES, steps: int = 5, write_doc: bool = True, po
             else:
                 results[w["worker_id"]]["failed"] = r["error"]
         if not mesh.get("failed"):
-            r = submit(cfg, enforce=True)
+            r = submit(cfg, num_stages=len(workers), enforce=True)
             if r["ok"]:
                 mesh.update(max_P=P, steps_per_s=r["steps_per_s"], stages=r["stages"])
             else:
@@ -211,12 +213,15 @@ def run_hardware(client, sizes=SIZES, steps: int = 5, write_doc: bool = True, po
     def clean(err):
         return (err or "").replace("\n", " ").replace("|", "/")[:120]
 
-    rows = [[wid, f"{v.get('max_P', 0) / 1e6:.1f}M", f"{v.get('steps_per_s') or 0:.3f}", clean(v.get("failed"))]
+    rows = [[wid, f"{v.get('max_P', 0) / 1e6:.1f}M", f"{v.get('steps_per_s') or 0:.3f}",
+             1 if "max_P" in v else "-", clean(v.get("failed"))]
             for wid, v in results.items()]
     rows.append(["MeshTrain", f"{mesh.get('max_P', 0) / 1e6:.1f}M", f"{mesh.get('steps_per_s') or 0:.3f}",
-                 clean(mesh.get("failed"))])
-    md = [environment_line(), "**Mode: hardware** (real devices via the coordinator).",
-          md_table(["device", "P_max", "steps/s at P_max", "first failure"], rows)]
+                 mesh.get("stages", "-"), clean(mesh.get("failed"))])
+    md = [environment_line(), "**Mode: hardware** (real devices via the coordinator). "
+          f"Mesh trials request {len(workers)} stages, one per online worker. "
+          "P_max is the largest successful size tested; a zero means no tested size succeeded, not zero capacity.",
+          md_table(["device", "P_max", "steps/s at P_max", "stages at P_max", "first failure"], rows)]
     if best and mesh.get("max_P"):
         md.append(f"capacity_gain = {mesh['max_P'] / best['max_P']:.2f}x, throughput penalty = "
                   f"{(best['steps_per_s'] or 0) / (mesh['steps_per_s'] or 1):.2f}x")
@@ -226,11 +231,13 @@ def run_hardware(client, sizes=SIZES, steps: int = 5, write_doc: bool = True, po
     return text
 
 
-def run_experiment5(mode: str = "emulated", cluster_file: str | None = None, steps: int = 5,
-                    client=None) -> str:
-    """``client``: a ControlClient for the running cluster (required for hardware mode)."""
+def run_experiment5(mode: str = "emulated", cluster_file: str | None = None, steps: int = 5, *, client=None) -> str:
+    """``client``: a ControlClient for the running cluster (hardware mode; defaults to the remembered cluster)."""
     if mode == "emulated":
         return run_emulated(steps=steps)
     if client is None:
-        raise ValueError("hardware mode needs a coordinator client")
-    return run_hardware(client, steps=steps)
+        from meshtrain.cli import _client
+
+        client = _client()
+    with client.http:
+        return run_hardware(client, steps=steps)

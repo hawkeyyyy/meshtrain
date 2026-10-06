@@ -18,10 +18,20 @@ UNBENCHMARKED_FLOPS = {"cuda": 5e12, "mps": 1e12, "cpu": 5e10}
 
 def worker_profile(w: WorkerRecord) -> WorkerProfile:
     dev = w.device_info
+    available = None
     if w.backend == "cpu":
         total = int(w.hardware.get("ram_available") or w.hardware.get("ram_total", 0))
     else:
         total = int(dev.get("memory_total", 0))
+        if w.backend == "cuda" and w.memory.get("free") is not None:
+            # The idle worker can reuse cached blocks, but live allocations and
+            # memory owned by other processes remain unavailable.
+            allocated = max(0, int(w.memory.get("allocated", 0)))
+            reserved = max(0, int(w.memory.get("reserved", 0)))
+            # Oversubscribed Windows allocator pools can include system RAM;
+            # those cached bytes are not evidence of reclaimable physical VRAM.
+            cache = max(0, reserved - allocated) if reserved <= total else 0
+            available = min(max(0, total - allocated), max(0, int(w.memory["free"]) + cache))
     caps = w.capabilities or {}
     if caps:  # measured by the worker's probes at registration
         dtypes = tuple(dt for dt, key in (("float32", "supports_fp32"), ("float16", "supports_fp16"),
@@ -38,7 +48,8 @@ def worker_profile(w: WorkerRecord) -> WorkerProfile:
                          unified_memory=bool(dev.get("unified_memory")), supported_dtypes=dtypes,
                          supported_ops=caps.get("op_capabilities"),
                          d2h_Bps=float(bench.get("d2h_Bps", default_copy)),
-                         h2d_Bps=float(bench.get("h2d_Bps", default_copy)))
+                         h2d_Bps=float(bench.get("h2d_Bps", default_copy)),
+                         memory_available=available)
 
 
 def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: NetworkModel | None = None,
