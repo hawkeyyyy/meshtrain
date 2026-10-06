@@ -71,6 +71,7 @@ class MemoryEstimate:
     host_staging: int = 0
     in_flight: int = 1
     available: int | None = None   # live free + reclaimable cache from a heartbeat (None = unknown)
+    residency: dict | None = None  # V2: residency plan (HOT/COLD layers) behind these numbers
 
     COMPONENTS = ("parameters", "gradients", "optimizer_state", "optimizer_step_temporary", "master_weights",
                   "saved_activations", "input_buffers", "output_buffers", "transport_buffers",

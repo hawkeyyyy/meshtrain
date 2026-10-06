@@ -173,6 +173,9 @@ class PlannerOptions:
     required_ops: tuple[str, ...] = ()
     async_transport: bool = False      # stage time = max(compute, comm) instead of the sum
     tie_tolerance: float = 0.02        # bottlenecks within 2% -> prefer fewer boundary bytes
+    # V2: tensor residency inside each stage (runtime/offload.py). None / static = V1.5 estimate.
+    residency: object = None           # runtime.offload.ResidencyPolicy
+    accelerator_budget: int | None = None  # per-stage cap (memory.accelerator_budget*); None = device usable
 
     def memory_kwargs(self, backend: str) -> dict:
         if self.headroom_fraction is not None or self.headroom_min_bytes is not None:
@@ -211,8 +214,33 @@ class _Evaluator:
                                     max_inflight=self.opts.max_inflight, backend=w.backend,
                                     activation_safety=self.opts.activation_safety, available=w.memory_available,
                                     **self.opts.memory_kwargs(w.backend))
+        pol = self.opts.residency
+        if pol is not None and getattr(pol, "active", False):
+            mem = self._offload_estimate(mem, w, idx, len(workers), start, end, last)
+        elif self.opts.accelerator_budget is not None:   # static strategy under an explicit budget
+            mem.usable = min(mem.usable, self.opts.accelerator_budget)
         return StagePlan(idx, w.worker_id, w.name, w.backend, start, end, mem, comp, comm, out_bytes,
                          overlap=self.opts.async_transport, comm_detail=detail)
+
+    def _offload_estimate(self, mem, w, idx, n, start, end, last):
+        """Replace the static model-state terms with what the residency plan keeps on the device."""
+        from meshtrain.planner.residency import plan_residency
+
+        budget = mem.usable if self.opts.accelerator_budget is None else min(mem.usable, self.opts.accelerator_budget)
+        rp = plan_residency(self.layers[start:end], budget=budget, policy=self.opts.residency,
+                            optimizer=self.opts.optimizer, backend=w.backend,
+                            num_microbatches=self.opts.num_microbatches, schedule=self.opts.schedule,
+                            stage_index=idx, num_stages=n, h2d_Bps=w.h2d_Bps or None, d2h_Bps=w.d2h_Bps or None,
+                            flops=w.measured_flops)
+        d = rp.device_bytes
+        mem.parameters = d["hot parameters"] + d["loaded cold layers"]
+        mem.gradients = d["hot gradients"] + d["gradient workspace"]
+        mem.optimizer_state = d["hot optimizer state"] + d["cold optimizer state"]
+        mem.optimizer_step_temporary = d["optimizer workspace"]
+        mem.usable = min(mem.usable, int(budget * 0.90))   # same fragmentation margin as the residency planner
+        mem.residency = rp.to_dict()
+        return mem
+
 
 
 def _usable(w: WorkerProfile, opts: PlannerOptions) -> int:

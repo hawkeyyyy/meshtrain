@@ -79,6 +79,8 @@ def plan_job(cfg: MeshTrainConfig, workers: list[WorkerRecord], network: Network
         framework_reserve=cfg.memory.framework_reserve_bytes(),
         budget_overrides=dict(budget_overrides or {}),
         async_transport=cfg.transport.async_,
+        residency=cfg.residency_policy(),
+        accelerator_budget=cfg.memory.budget_bytes(None),
         required_ops=tuple(spec.required_ops) + (("adamw",) if cfg.training.optimizer in ("adam", "adamw") else ()),
     )
     if pc.strategy == "manual":

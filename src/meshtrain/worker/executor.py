@@ -135,9 +135,24 @@ def run_assignment(
         logger.log("STAGE_ASSIGNED", stage=idx, layers=f"{start}-{end - 1}", device=str(device.device),
                    attempt=assignment.get("attempt", 0))
         try:
+            policy = cfg.residency_policy()
+            budget = cfg.memory.budget_bytes(device.memory_total(), device.backend)
+            if policy.active:
+                from meshtrain.planner.residency import resolve_stage_policy
+
+                M = cfg.training.num_microbatches
+                policy, rplan = resolve_stage_policy(policy, spec, start, end,
+                                                     microbatch_size=cfg.training.batch_size // M, budget=budget,
+                                                     optimizer=cfg.training.optimizer, backend=device.backend,
+                                                     num_microbatches=M, schedule=cfg.pipeline.schedule,
+                                                     stage_index=idx, num_stages=n)
+                if rplan is not None:
+                    logger.log("RESIDENCY_PLAN", stage=idx, hot=len(rplan.hot_groups),
+                               cold=len(rplan.groups) - len(rplan.hot_groups),
+                               device_gb=round(rplan.device_total / 1024**3, 3))
             stage = Stage(spec.build_stage(start, end), stage_index=idx, num_stages=n, device=device,
                           optimizer=cfg.training.optimizer, lr=cfg.training.learning_rate, loss_fn=spec.loss_fn,
-                          name=worker_name, layer_offset=start)
+                          name=worker_name, layer_offset=start, residency=policy, accelerator_budget=budget)
             report = None
             if cfg.memory.validate_runtime_usage:
                 sf = cfg.memory.safety_factors().get(device.backend, cfg.memory.safety_factor)
@@ -198,6 +213,8 @@ def run_assignment(
         for link in (up, down):
             if link is not None:
                 link.close()
+        if stage is not None:
+            stage.close()   # hooks and the allocator cap (this worker runs later jobs too)
         stage = None
         release_device_memory(device)
         logger.close()
